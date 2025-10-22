@@ -30,7 +30,7 @@ $startTime = Get-Date
 $script:findings = @()
 $script:auditLog = @()
 $script:silentMode = $true  # Silent scanning mode - no detailed output
-$script:totalChecks = 17
+$script:totalChecks = 29  # Updated: 18 original + 11 advanced detection checks
 $script:currentCheck = 0
 $script:redactInfo = $RedactSensitiveInfo
 
@@ -82,6 +82,148 @@ function Get-ProcessCommandLine {
     $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue).CommandLine
     $script:processCache[$ProcessId] = $cmdLine
     return $cmdLine
+}
+
+# Enhanced operation logging system - extremely verbose for forensic verification
+$script:operationLogEntries = [System.Collections.ArrayList]::new()
+$script:operationLogPath = $null
+
+function Write-OperationLog {
+    <#
+    .SYNOPSIS
+    Logs every operation performed by the script for forensic verification
+    .DESCRIPTION
+    Creates an extremely verbose, timestamped log of all actions taken by the script.
+    This log serves as proof that all findings are legitimate and verifiable.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS", "QUERY", "FINDING", "ACTION")]
+        [string]$Level = "INFO",
+        
+        [Parameter(Mandatory=$false)]
+        [hashtable]$Details = @{}
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    $threadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+    
+    # Build detailed log entry
+    $logEntry = @{
+        Timestamp = $timestamp
+        ThreadID = $threadId
+        Level = $Level
+        Message = $Message
+        Details = $Details
+    }
+    
+    # Format for human readability
+    $formattedEntry = "[$timestamp] [$Level] [TID:$threadId] $Message"
+    
+    # Add details if present
+    if ($Details.Count -gt 0) {
+        $detailsText = $Details.GetEnumerator() | ForEach-Object {
+            "    ↳ $($_.Key): $($_.Value)"
+        }
+        $formattedEntry += "`n" + ($detailsText -join "`n")
+    }
+    
+    # Add to in-memory collection
+    $null = $script:operationLogEntries.Add($formattedEntry)
+    
+    # Immediately write to file if path is set (real-time logging)
+    if ($script:operationLogPath) {
+        try {
+            Add-Content -Path $script:operationLogPath -Value $formattedEntry -ErrorAction SilentlyContinue
+        } catch {
+            # Silently fail if can't write - don't break the scan
+        }
+    }
+}
+
+function Initialize-OperationLog {
+    <#
+    .SYNOPSIS
+    Initializes the operation log file with header information
+    #>
+    param([string]$LogPath)
+    
+    $script:operationLogPath = $LogPath
+    
+    $header = @"
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    SYSTEM ANALYZER OPERATION LOG                             ║
+║                      FORENSIC VERIFICATION LOG                               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+PURPOSE:
+This log contains a complete, timestamped record of every operation performed
+by the System Analyzer script. It serves as forensic evidence that all findings
+are legitimate and verifiable. Every query, check, and finding is logged here.
+
+CREATED: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+COMPUTER: $(if ($script:redactInfo) { 'REDACTED' } else { $env:COMPUTERNAME })
+USER: $(if ($script:redactInfo) { 'REDACTED' } else { $env:USERNAME })
+SCRIPT VERSION: 3.0 (29 checks)
+POWERSHELL VERSION: $($PSVersionTable.PSVersion)
+OS VERSION: $((Get-CimInstance Win32_OperatingSystem).Caption)
+EXECUTION POLICY: $(Get-ExecutionPolicy)
+
+═══════════════════════════════════════════════════════════════════════════════
+                              OPERATION LOG STARTS
+═══════════════════════════════════════════════════════════════════════════════
+
+"@
+    
+    try {
+        Set-Content -Path $LogPath -Value $header -ErrorAction Stop
+        Write-OperationLog "Operation log initialized at: $LogPath" "SUCCESS"
+    } catch {
+        Write-Host "[!] WARNING: Could not initialize operation log: $_" -ForegroundColor Yellow
+    }
+}
+
+function Save-OperationLog {
+    <#
+    .SYNOPSIS
+    Finalizes the operation log with summary statistics
+    #>
+    
+    if (-not $script:operationLogPath) { return }
+    
+    $footer = @"
+
+═══════════════════════════════════════════════════════════════════════════════
+                              OPERATION LOG ENDS
+═══════════════════════════════════════════════════════════════════════════════
+
+SUMMARY:
+Total Log Entries: $($script:operationLogEntries.Count)
+End Time: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+Log Entry Breakdown:
+$(($script:operationLogEntries | Where-Object {$_ -match '\[INFO\]'}).Count) INFO messages
+$(($script:operationLogEntries | Where-Object {$_ -match '\[WARNING\]'}).Count) WARNING messages
+$(($script:operationLogEntries | Where-Object {$_ -match '\[ERROR\]'}).Count) ERROR messages
+$(($script:operationLogEntries | Where-Object {$_ -match '\[SUCCESS\]'}).Count) SUCCESS messages
+$(($script:operationLogEntries | Where-Object {$_ -match '\[QUERY\]'}).Count) QUERY operations
+$(($script:operationLogEntries | Where-Object {$_ -match '\[FINDING\]'}).Count) FINDING entries
+$(($script:operationLogEntries | Where-Object {$_ -match '\[ACTION\]'}).Count) ACTION operations
+
+This log can be independently verified by reviewing each timestamp and operation.
+All WMI/CIM queries, registry accesses, and file operations are documented above.
+
+═══════════════════════════════════════════════════════════════════════════════
+"@
+    
+    try {
+        Add-Content -Path $script:operationLogPath -Value $footer -ErrorAction Stop
+    } catch {
+        Write-Host "[!] WARNING: Could not finalize operation log: $_" -ForegroundColor Yellow
+    }
 }
 
 # Optimized: Get signature with caching
@@ -291,6 +433,217 @@ function Test-DriverCertificate {
     return $issues
 }
 
+# Security Enhancement: Known driver file hashes (detects renamed drivers)
+# Even if driver filename is changed, hash remains the same
+$knownDriverHashes = @{
+    # CH341 Serial Driver variants (commonly used for hardware modification)
+    "8E7D4C3F2A1B9E5F6C8A9D7E4B3F2C1A5E6D7F8A9B0C1D2E3F4A5B6C7D8E9F0A" = @{ Name="CH341 Serial v3.4"; Risk="HIGH"; Component="USB-Serial bridge" }
+    "9F8E7D6C5B4A3F2E1D0C9B8A7F6E5D4C3B2A1F0E9D8C7B6A5F4E3D2C1B0A9F8E" = @{ Name="CH341 Serial v3.5"; Risk="HIGH"; Component="USB-Serial bridge" }
+    
+    # FTDI Serial Driver variants
+    "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2" = @{ Name="FTDI Serial v2.12"; Risk="MEDIUM"; Component="USB-Serial communication" }
+    
+    # Xilinx Platform Cable USB drivers
+    "B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2C3" = @{ Name="Xilinx Platform USB"; Risk="HIGH"; Component="FPGA programming interface" }
+    
+    # CP210x Serial drivers
+    "C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2C3D4" = @{ Name="CP210x USB to UART"; Risk="MEDIUM"; Component="USB-Serial bridge" }
+    
+    # Interception driver (input redirection)
+    "D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2C3D4E5" = @{ Name="Interception Driver"; Risk="HIGH"; Component="Input redirection/emulation" }
+    
+    # WinDivert packet filter
+    "E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2C3D4E5F6" = @{ Name="WinDivert"; Risk="MEDIUM"; Component="Network packet filtering" }
+}
+# Note: Real hashes would be collected from known driver samples
+# This is a template for the hash database structure
+
+#region Baseline Comparison Functions
+# These functions allow comparing current system state against a known-good baseline
+
+function Export-SystemBaseline {
+    <#
+    .SYNOPSIS
+    Creates a baseline snapshot of system when it's known to be clean
+    .DESCRIPTION
+    Exports driver list, PCI devices, services, and security settings to a JSON file
+    #>
+    param(
+        [string]$BaselinePath = (Join-Path $PSScriptRoot "system-baseline.json")
+    )
+    
+    try {
+        Write-OperationLog "Creating system baseline at: $BaselinePath" "INFO"
+        
+        $baseline = @{
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            ComputerName = $env:COMPUTERNAME
+            Drivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | 
+                       Select-Object Name, PathName, State, StartMode | 
+                       ForEach-Object {
+                           @{
+                               Name = $_.Name
+                               PathName = $_.PathName
+                               State = $_.State
+                               StartMode = $_.StartMode
+                           }
+                       })
+            PCIDevices = @(Get-PnpDevice -Class "System","HDC","Net" -ErrorAction SilentlyContinue | 
+                          Select-Object InstanceId, Status, FriendlyName | 
+                          ForEach-Object {
+                              @{
+                                  InstanceId = $_.InstanceId
+                                  Status = $_.Status
+                                  FriendlyName = $_.FriendlyName
+                              }
+                          })
+            Services = @(Get-Service -ErrorAction SilentlyContinue | 
+                        Select-Object Name, Status, StartType | 
+                        ForEach-Object {
+                            @{
+                                Name = $_.Name
+                                Status = $_.Status.ToString()
+                                StartType = $_.StartType.ToString()
+                            }
+                        })
+            SecureBoot = (try { Confirm-SecureBootUEFI } catch { $false })
+            DMAProtection = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\DmaSecurity" -ErrorAction SilentlyContinue).DmaProtectionEnabled -eq 1
+        }
+        
+        $baseline | ConvertTo-Json -Depth 5 | Out-File $BaselinePath -Encoding UTF8
+        Write-OperationLog "Baseline created successfully: $($baseline.Drivers.Count) drivers, $($baseline.PCIDevices.Count) devices" "INFO"
+        
+        return $true
+    } catch {
+        Write-OperationLog "Error creating baseline: $_" "ERROR"
+        return $false
+    }
+}
+
+function Compare-ToBaseline {
+    <#
+    .SYNOPSIS
+    Compares current system state to previously created baseline
+    .DESCRIPTION
+    Returns findings for new/removed drivers, devices, or security changes
+    #>
+    param(
+        [string]$BaselinePath = (Join-Path $PSScriptRoot "system-baseline.json")
+    )
+    
+    $findings = @()
+    
+    try {
+        if (-not (Test-Path $BaselinePath)) {
+            return @{
+                Category = "Baseline Not Found"
+                Severity = "INFO"
+                Evidence = "No baseline file exists at $BaselinePath"
+                Impact = "Cannot perform baseline comparison - run Export-SystemBaseline first"
+                SuspicionScore = 0
+            }
+        }
+        
+        $baseline = Get-Content $BaselinePath -ErrorAction Stop | ConvertFrom-Json
+        Write-OperationLog "Comparing against baseline from $($baseline.Timestamp)" "INFO"
+        
+        # Get current state
+        $currentDrivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | 
+                           Select-Object Name, PathName, State)
+        $currentDevices = @(Get-PnpDevice -Class "System","HDC","Net" -ErrorAction SilentlyContinue | 
+                           Select-Object InstanceId, Status, FriendlyName)
+        
+        # Find new drivers not in baseline
+        $newDrivers = @($currentDrivers | Where-Object {
+            $driver = $_
+            -not ($baseline.Drivers | Where-Object {$_.Name -eq $driver.Name})
+        })
+        
+        if ($newDrivers.Count -gt 0) {
+            $findings += @{
+                Category = "New Drivers Since Baseline"
+                Severity = "MEDIUM"
+                Evidence = "Found $($newDrivers.Count) driver(s) not in baseline"
+                NewDriverList = ($newDrivers.Name -join ", ")
+                Impact = "New drivers may indicate installed hardware or malware"
+                SuspicionScore = 40
+            }
+            Write-OperationLog "MEDIUM: $($newDrivers.Count) new drivers since baseline" "WARNING"
+        }
+        
+        # Find removed drivers (in baseline but not current)
+        $removedDrivers = @($baseline.Drivers | Where-Object {
+            $baseDriver = $_
+            -not ($currentDrivers | Where-Object {$_.Name -eq $baseDriver.Name})
+        })
+        
+        if ($removedDrivers.Count -gt 0) {
+            $findings += @{
+                Category = "Removed Drivers Since Baseline"
+                Severity = "LOW"
+                Evidence = "Found $($removedDrivers.Count) driver(s) removed since baseline"
+                RemovedDriverList = ($removedDrivers.Name -join ", ")
+                SuspicionScore = 10
+            }
+        }
+        
+        # Find new PCI devices
+        $newDevices = @($currentDevices | Where-Object {
+            $device = $_
+            -not ($baseline.PCIDevices | Where-Object {$_.InstanceId -eq $device.InstanceId})
+        })
+        
+        if ($newDevices.Count -gt 0) {
+            $findings += @{
+                Category = "New Hardware Since Baseline"
+                Severity = "HIGH"
+                Evidence = "Found $($newDevices.Count) new hardware device(s)"
+                NewDeviceList = ($newDevices.FriendlyName -join ", ")
+                Impact = "New hardware may be DMA attack device or modified peripheral"
+                SuspicionScore = 55
+            }
+            Write-OperationLog "HIGH: $($newDevices.Count) new hardware devices since baseline" "WARNING"
+        }
+        
+        # Check security setting changes
+        $currentSecureBoot = try { Confirm-SecureBootUEFI } catch { $false }
+        if ($baseline.SecureBoot -and -not $currentSecureBoot) {
+            $findings += @{
+                Category = "Secure Boot Disabled Since Baseline"
+                Severity = "CRITICAL"
+                Evidence = "Secure Boot was enabled in baseline but is now disabled"
+                Impact = "Critical security feature has been disabled"
+                SuspicionScore = 80
+            }
+            Write-OperationLog "CRITICAL: Secure Boot disabled since baseline!" "WARNING"
+        }
+        
+        $currentDMAProtection = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\DmaSecurity" -ErrorAction SilentlyContinue).DmaProtectionEnabled -eq 1
+        if ($baseline.DMAProtection -and -not $currentDMAProtection) {
+            $findings += @{
+                Category = "DMA Protection Disabled Since Baseline"
+                Severity = "CRITICAL"
+                Evidence = "Kernel DMA Protection was enabled in baseline but is now disabled"
+                Impact = "DMA attacks are now possible"
+                SuspicionScore = 85
+            }
+            Write-OperationLog "CRITICAL: DMA Protection disabled since baseline!" "WARNING"
+        }
+        
+        return $findings
+        
+    } catch {
+        Write-OperationLog "Error comparing to baseline: $_" "ERROR"
+        return @{
+            Category = "Baseline Comparison Error"
+            Severity = "LOW"
+            Evidence = "Error reading or comparing baseline: $_"
+            SuspicionScore = 5
+        }
+    }
+}
+#endregion Baseline Comparison Functions
+
 # Hardware device signatures for analysis
 $knownDMADevices = @{
     # FPGA development boards
@@ -436,6 +789,21 @@ function Get-DriverSuspicionScore {
     
     $score = 0
     $evidence = @()
+    
+    # Security: Check driver file hash against known database (catches renamed drivers)
+    if ($DriverPath -and (Test-Path $DriverPath)) {
+        try {
+            $driverHash = (Get-FileHash -Path $DriverPath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+            if ($driverHash -and $script:knownDriverHashes.ContainsKey($driverHash)) {
+                $hashInfo = $script:knownDriverHashes[$driverHash]
+                $score += 40  # Strong evidence - file hash matches known driver
+                $evidence += "File hash matches known driver: $($hashInfo.Name) [$($hashInfo.Component)]"
+                $evidence += "Driver may be renamed - hash detection bypasses filename spoofing"
+            }
+        } catch {
+            # Hash calculation failed - not critical
+        }
+    }
     
     # Certificate validation (CRITICAL)
     if ($DriverPath -and (Test-Path $DriverPath)) {
@@ -1084,6 +1452,59 @@ try {
             $deviceClass = $dev.Class
             $deviceName = $dev.FriendlyName
             
+            # Security: Device functionality cross-check (detect spoofed device classes)
+            # If device claims to be network adapter, verify it has actual network functionality
+            if ($deviceClass -eq "Net") {
+                try {
+                    $netAdapter = Get-NetAdapter -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.InterfaceDescription -eq $deviceName }
+                    
+                    if (-not $netAdapter) {
+                        # Device claims to be network adapter but has no network interface
+                        $suspiciousCount++
+                        Add-Finding -Category "Device Functionality Mismatch" -Severity "HIGH" `
+                            -Description "Device claims to be network adapter but has no active network interface" `
+                            -Details @{
+                                DeviceName = $deviceName
+                                DeviceClass = $deviceClass
+                                InstanceID = $dev.InstanceId
+                                Issue = "Class=Net but not found in Get-NetAdapter - possible spoofing"
+                            }
+                    }
+                } catch { }
+            }
+            
+            # Check for certificate vs device manufacturer mismatch
+            try {
+                $deviceMfr = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName "DEVPKEY_Device_Manufacturer" -ErrorAction SilentlyContinue).Data
+                $driverInfPath = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName "DEVPKEY_Device_DriverInfPath" -ErrorAction SilentlyContinue).Data
+                
+                if ($driverInfPath) {
+                    $infFullPath = Join-Path "$env:SystemRoot\INF" $driverInfPath
+                    if (Test-Path $infFullPath) {
+                        $infContent = Get-Content $infFullPath -ErrorAction SilentlyContinue | Select-Object -First 50
+                        $infProvider = ($infContent | Where-Object { $_ -match "^Provider\s*=" }) -replace "Provider\s*=\s*", "" -replace '["%]', ''
+                        
+                        # Check for manufacturer mismatch
+                        if ($deviceMfr -and $infProvider) {
+                            # If device says Intel but INF says WCH = suspicious
+                            if ($deviceMfr -match "Intel" -and $infProvider -match "WCH|FTDI|Prolific") {
+                                $suspiciousCount++
+                                Add-Finding -Category "Device Functionality Mismatch" -Severity "HIGH" `
+                                    -Description "Device manufacturer doesn't match driver provider" `
+                                    -Details @{
+                                        DeviceName = $deviceName
+                                        DeviceManufacturer = $deviceMfr
+                                        DriverProvider = $infProvider
+                                        InstanceID = $dev.InstanceId
+                                        Issue = "Manufacturer mismatch suggests device spoofing"
+                                    }
+                            }
+                        }
+                    }
+                }
+            } catch { }
+            
             # Suspicious: USB devices reporting as PCI (may indicate hardware configuration anomaly)
             $compatIds = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName "DEVPKEY_Device_CompatibleIds" -ErrorAction SilentlyContinue).Data
             if ($dev.InstanceId -like "PCI\*" -and $compatIds -like "*USB*") {
@@ -1673,19 +2094,45 @@ if (-not (Test-SafePath -Path $forensicFolder -BaseDirectory $scanFolder)) {
 
 $null = New-Item -Path $forensicFolder -ItemType Directory -Force
 
+# Initialize comprehensive operation log for forensic verification
+$operationLogPath = Join-Path $forensicFolder "OPERATION_LOG.txt"
+Initialize-OperationLog -LogPath $operationLogPath
+
+Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+Write-OperationLog "SYSTEM ANALYSIS STARTING" "INFO"
+Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+Write-OperationLog "Forensic data collection folder created" "ACTION" -Details @{
+    Path = $forensicFolder
+    CreatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+}
+
 try {
     # 1. Collect System Information
     # Silent collection
     $sysInfoPath = Join-Path $forensicFolder "SystemInfo.txt"
+    
+    Write-OperationLog "Collecting system information" "QUERY" -Details @{
+        Command = "systeminfo.exe"
+        OutputPath = $sysInfoPath
+    }
     
     # Security: Validate systeminfo command exists and execute safely
     $systeminfoCmd = Get-Command systeminfo.exe -ErrorAction SilentlyContinue
     if ($systeminfoCmd) {
         try {
             & $systeminfoCmd.Source | Out-File -FilePath $sysInfoPath -Encoding UTF8 -ErrorAction Stop
+            Write-OperationLog "System information collected successfully" "SUCCESS" -Details @{
+                FileSize = (Get-Item $sysInfoPath).Length
+                Lines = (Get-Content $sysInfoPath).Count
+            }
         } catch {
+            Write-OperationLog "Failed to collect system information" "ERROR" -Details @{
+                Error = $_.Exception.Message
+            }
             Write-Host "[!] Warning: Failed to collect system information: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+    } else {
+        Write-OperationLog "systeminfo.exe command not found" "WARNING"
     }
     
     Get-ComputerInfo -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 5 -WarningAction SilentlyContinue | Out-File -FilePath (Join-Path $forensicFolder "ComputerInfo.json") -Encoding UTF8
@@ -1695,11 +2142,21 @@ try {
     $regFolder = Join-Path $forensicFolder "Registry"
     $null = New-Item -Path $regFolder -ItemType Directory -Force
     
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    Write-OperationLog "REGISTRY EXPORT PHASE STARTING" "INFO"
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    
     # Security: Validate reg.exe and execute registry exports safely
     $regCmd = Get-Command reg.exe -ErrorAction SilentlyContinue
     if (-not $regCmd) {
+        Write-OperationLog "reg.exe command not found - skipping registry exports" "WARNING"
         Write-Host "[!] Warning: reg.exe not found, skipping registry exports" -ForegroundColor Yellow
     } else {
+        Write-OperationLog "reg.exe located" "INFO" -Details @{
+            Path = $regCmd.Source
+            Version = $regCmd.Version
+        }
+        
         # Security: Define allowed registry keys for export (defense-in-depth)
         $allowedRegistryKeys = @(
             "HKLM\SYSTEM\CurrentControlSet\Enum",
@@ -1722,29 +2179,430 @@ try {
             @{ Key = "HKLM\SYSTEM\DriverDatabase"; File = "DriverDatabase.reg" }
         )
         
+        Write-OperationLog "Starting registry exports" "ACTION" -Details @{
+            TotalExports = $regExports.Count
+            OutputFolder = $regFolder
+        }
+        
         foreach ($export in $regExports) {
             # Security: Validate registry key against allowlist
             if ($allowedRegistryKeys -notcontains $export.Key) {
+                Write-OperationLog "Registry key not in allowlist - skipping" "WARNING" -Details @{
+                    Key = $export.Key
+                }
                 Write-Verbose "Skipping unauthorized registry key: $($export.Key)"
                 continue
             }
             
+            Write-OperationLog "Exporting registry key" "QUERY" -Details @{
+                RegistryKey = $export.Key
+                OutputFile = $export.File
+                Command = "reg.exe export"
+            }
+            
             try {
                 $outputFile = Join-Path $regFolder $export.File
+                $startTime = Get-Date
                 $result = & $regCmd.Source export $export.Key $outputFile /y 2>&1
+                $duration = ((Get-Date) - $startTime).TotalMilliseconds
+                
                 if ($LASTEXITCODE -ne 0) {
+                    Write-OperationLog "Registry export failed" "ERROR" -Details @{
+                        Key = $export.Key
+                        ExitCode = $LASTEXITCODE
+                        ErrorOutput = $result
+                        DurationMs = [math]::Round($duration, 2)
+                    }
                     Write-Verbose "Registry export failed for $($export.Key): $result"
+                } else {
+                    $fileSize = if (Test-Path $outputFile) { (Get-Item $outputFile).Length } else { 0 }
+                    Write-OperationLog "Registry export successful" "SUCCESS" -Details @{
+                        Key = $export.Key
+                        OutputFile = $outputFile
+                        FileSizeBytes = $fileSize
+                        FileSizeKB = [math]::Round($fileSize / 1KB, 2)
+                        DurationMs = [math]::Round($duration, 2)
+                    }
                 }
             } catch {
+                Write-OperationLog "Registry export exception" "ERROR" -Details @{
+                    Key = $export.Key
+                    Exception = $_.Exception.Message
+                    StackTrace = $_.ScriptStackTrace
+                }
                 Write-Verbose "Error exporting registry key $($export.Key): $($_.Exception.Message)"
             }
         }
+        
+        Write-OperationLog "Registry export phase completed" "SUCCESS" -Details @{
+            SuccessfulExports = (Get-ChildItem $regFolder -Filter "*.reg" -ErrorAction SilentlyContinue).Count
+            TotalAttempted = $regExports.Count
+        }
     }
     
-    # 3. Collect Log Files
+    # 3. Collect Hardware IDs (Current and Historical)
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    Write-OperationLog "HARDWARE ID COLLECTION STARTING" "INFO"
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    
+    $hwidPath = Join-Path $forensicFolder "HARDWARE_IDS.txt"
+    $hwidContent = @()
+    
+    $hwidContent += "════════════════════════════════════════════════════════════════════════════════"
+    $hwidContent += "                        HARDWARE ID INVENTORY REPORT"
+    $hwidContent += "════════════════════════════════════════════════════════════════════════════════"
+    $hwidContent += ""
+    $hwidContent += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $hwidContent += "Computer: $(if ($script:redactInfo) { 'REDACTED' } else { $env:COMPUTERNAME })"
+    $hwidContent += ""
+    $hwidContent += "This document contains Hardware IDs (HWIDs) for all devices - both currently"
+    $hwidContent += "connected and historically installed. HWIDs uniquely identify hardware components"
+    $hwidContent += "and can be used to detect device substitution, cloning, or tampering."
+    $hwidContent += ""
+    $hwidContent += "════════════════════════════════════════════════════════════════════════════════"
+    $hwidContent += ""
+    
+    Write-OperationLog "Collecting current device HWIDs via WMI" "QUERY"
+    
+    # Section 1: Currently Connected Devices
+    $hwidContent += ""
+    $hwidContent += "╔════════════════════════════════════════════════════════════════════════════╗"
+    $hwidContent += "║                     SECTION 1: CURRENTLY CONNECTED DEVICES                 ║"
+    $hwidContent += "╚════════════════════════════════════════════════════════════════════════════╝"
+    $hwidContent += ""
+    
+    try {
+        $currentDevices = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop | 
+            Where-Object { $_.DeviceID -and $_.Name } |
+            Sort-Object Name
+        
+        $deviceCount = 0
+        $categorizedDevices = @{}
+        
+        foreach ($device in $currentDevices) {
+            # Categorize devices by class
+            $class = if ($device.PNPClass) { $device.PNPClass } else { "Unknown" }
+            
+            if (-not $categorizedDevices.ContainsKey($class)) {
+                $categorizedDevices[$class] = @()
+            }
+            
+            $categorizedDevices[$class] += $device
+            $deviceCount++
+        }
+        
+        $hwidContent += "Total Currently Connected Devices: $deviceCount"
+        $hwidContent += "Device Classes Found: $($categorizedDevices.Keys.Count)"
+        $hwidContent += ""
+        $hwidContent += "─" * 80
+        $hwidContent += ""
+        
+        # Output devices by category
+        foreach ($class in ($categorizedDevices.Keys | Sort-Object)) {
+            $hwidContent += ""
+            $hwidContent += "┌─ Device Class: $class ($($categorizedDevices[$class].Count) devices) " + ("─" * (60 - $class.Length))
+            $hwidContent += ""
+            
+            foreach ($device in $categorizedDevices[$class]) {
+                $hwidContent += "  Device Name: $($device.Name)"
+                $hwidContent += "  Hardware ID: $($device.DeviceID)"
+                
+                if ($device.Manufacturer -and $device.Manufacturer -ne "") {
+                    $hwidContent += "  Manufacturer: $($device.Manufacturer)"
+                }
+                
+                if ($device.Status) {
+                    $hwidContent += "  Status: $($device.Status)"
+                }
+                
+                if ($device.ConfigManagerErrorCode -ne 0) {
+                    $hwidContent += "  ⚠ Error Code: $($device.ConfigManagerErrorCode)"
+                }
+                
+                # Get compatible IDs if available
+                if ($device.CompatibleID) {
+                    $hwidContent += "  Compatible IDs:"
+                    foreach ($compatId in $device.CompatibleID) {
+                        $hwidContent += "    - $compatId"
+                    }
+                }
+                
+                $hwidContent += "  $("─" * 78)"
+            }
+        }
+        
+        Write-OperationLog "Current device HWIDs collected" "SUCCESS" -Details @{
+            TotalDevices = $deviceCount
+            DeviceClasses = $categorizedDevices.Keys.Count
+        }
+        
+    } catch {
+        $hwidContent += "ERROR: Failed to collect current device information - $($_.Exception.Message)"
+        Write-OperationLog "Failed to collect current device HWIDs" "ERROR" -Details @{
+            Error = $_.Exception.Message
+        }
+    }
+    
+    # Section 2: Historical Devices (from Registry)
+    $hwidContent += ""
+    $hwidContent += ""
+    $hwidContent += "╔════════════════════════════════════════════════════════════════════════════╗"
+    $hwidContent += "║                     SECTION 2: HISTORICAL DEVICE RECORDS                   ║"
+    $hwidContent += "╚════════════════════════════════════════════════════════════════════════════╝"
+    $hwidContent += ""
+    $hwidContent += "These are devices that were previously connected but may not be present now."
+    $hwidContent += "This includes USB devices, PCIe cards, and other hardware that has been"
+    $hwidContent += "installed at any point in the system's history."
+    $hwidContent += ""
+    
+    Write-OperationLog "Collecting historical device HWIDs from registry" "QUERY"
+    
+    try {
+        # Read from DeviceClasses registry which stores historical device info
+        $deviceClassesPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceClasses"
+        
+        if (Test-Path $deviceClassesPath) {
+            $historicalDevices = @()
+            $interfaceGuids = Get-ChildItem -Path $deviceClassesPath -ErrorAction SilentlyContinue
+            
+            foreach ($guid in $interfaceGuids) {
+                $devices = Get-ChildItem -Path $guid.PSPath -ErrorAction SilentlyContinue
+                
+                foreach ($device in $devices) {
+                    # Extract hardware ID from registry path
+                    $hwid = $device.PSChildName
+                    
+                    # Skip if not a valid device path
+                    if ($hwid -match '##\?#') {
+                        # Parse the device ID
+                        $cleanHwid = $hwid -replace '##\?#', '' -replace '##{.*}', ''
+                        
+                        # Get additional properties if available
+                        $deviceProps = Get-ItemProperty -Path $device.PSPath -ErrorAction SilentlyContinue
+                        
+                        $historicalDevices += [PSCustomObject]@{
+                            HardwareID = $cleanHwid
+                            InterfaceGUID = $guid.PSChildName
+                            RegistryPath = $device.PSPath
+                        }
+                    }
+                }
+            }
+            
+            # Remove duplicates
+            $uniqueHistorical = $historicalDevices | Sort-Object HardwareID -Unique
+            
+            $hwidContent += "Total Historical Device Records: $($uniqueHistorical.Count)"
+            $hwidContent += ""
+            $hwidContent += "─" * 80
+            $hwidContent += ""
+            
+            foreach ($histDevice in $uniqueHistorical) {
+                $hwidContent += "  Hardware ID: $($histDevice.HardwareID)"
+                $hwidContent += "  Interface GUID: $($histDevice.InterfaceGUID)"
+                $hwidContent += "  $("─" * 78)"
+            }
+            
+            Write-OperationLog "Historical device HWIDs collected" "SUCCESS" -Details @{
+                TotalHistoricalRecords = $uniqueHistorical.Count
+            }
+            
+        } else {
+            $hwidContent += "WARNING: DeviceClasses registry path not accessible"
+            Write-OperationLog "DeviceClasses registry not accessible" "WARNING"
+        }
+        
+    } catch {
+        $hwidContent += "ERROR: Failed to collect historical device information - $($_.Exception.Message)"
+        Write-OperationLog "Failed to collect historical device HWIDs" "ERROR" -Details @{
+            Error = $_.Exception.Message
+        }
+    }
+    
+    # Section 3: USB Device History (SetupAPI logs)
+    $hwidContent += ""
+    $hwidContent += ""
+    $hwidContent += "╔════════════════════════════════════════════════════════════════════════════╗"
+    $hwidContent += "║                     SECTION 3: USB DEVICE INSTALLATION HISTORY             ║"
+    $hwidContent += "╚════════════════════════════════════════════════════════════════════════════╝"
+    $hwidContent += ""
+    
+    Write-OperationLog "Parsing setupapi.dev.log for USB device history" "QUERY"
+    
+    try {
+        $setupapiLog = "C:\Windows\inf\setupapi.dev.log"
+        
+        if (Test-Path $setupapiLog) {
+            $logContent = Get-Content $setupapiLog -ErrorAction Stop
+            $usbDevices = @{}
+            
+            # Parse setupapi log for USB device installations
+            for ($i = 0; $i -lt $logContent.Count; $i++) {
+                $line = $logContent[$i]
+                
+                # Look for USB device installations
+                if ($line -match 'USB\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})') {
+                    $vid = $matches[1]
+                    $pid = $matches[2]
+                    $hwid = "USB\VID_$vid&PID_$pid"
+                    
+                    # Try to find the timestamp
+                    $timestamp = "Unknown"
+                    for ($j = [Math]::Max(0, $i - 10); $j -lt $i; $j++) {
+                        if ($logContent[$j] -match '\[(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})') {
+                            $timestamp = $matches[1]
+                            break
+                        }
+                    }
+                    
+                    # Try to find device description
+                    $description = "Unknown"
+                    for ($j = $i; $j -lt [Math]::Min($logContent.Count, $i + 20); $j++) {
+                        if ($logContent[$j] -match 'Device Install') {
+                            if ($logContent[$j + 1] -match '\"(.+?)\"') {
+                                $description = $matches[1]
+                                break
+                            }
+                        }
+                    }
+                    
+                    if (-not $usbDevices.ContainsKey($hwid)) {
+                        $usbDevices[$hwid] = @{
+                            Description = $description
+                            FirstSeen = $timestamp
+                            VID = $vid
+                            PID = $pid
+                        }
+                    }
+                }
+            }
+            
+            $hwidContent += "USB Devices Found in Installation Logs: $($usbDevices.Keys.Count)"
+            $hwidContent += ""
+            $hwidContent += "─" * 80
+            $hwidContent += ""
+            
+            foreach ($hwid in ($usbDevices.Keys | Sort-Object)) {
+                $dev = $usbDevices[$hwid]
+                $hwidContent += "  Hardware ID: $hwid"
+                $hwidContent += "  Vendor ID (VID): $($dev.VID)"
+                $hwidContent += "  Product ID (PID): $($dev.PID)"
+                $hwidContent += "  Description: $($dev.Description)"
+                $hwidContent += "  First Detected: $($dev.FirstSeen)"
+                $hwidContent += "  $("─" * 78)"
+            }
+            
+            Write-OperationLog "USB device history parsed from setupapi.dev.log" "SUCCESS" -Details @{
+                USBDevicesFound = $usbDevices.Keys.Count
+            }
+            
+        } else {
+            $hwidContent += "WARNING: setupapi.dev.log not found at C:\Windows\inf\setupapi.dev.log"
+            Write-OperationLog "setupapi.dev.log not found" "WARNING"
+        }
+        
+    } catch {
+        $hwidContent += "ERROR: Failed to parse setupapi.dev.log - $($_.Exception.Message)"
+        Write-OperationLog "Failed to parse setupapi.dev.log" "ERROR" -Details @{
+            Error = $_.Exception.Message
+        }
+    }
+    
+    # Footer
+    $hwidContent += ""
+    $hwidContent += ""
+    $hwidContent += "════════════════════════════════════════════════════════════════════════════════"
+    $hwidContent += "                             END OF HWID REPORT"
+    $hwidContent += "════════════════════════════════════════════════════════════════════════════════"
+    $hwidContent += ""
+    $hwidContent += "IMPORTANT NOTES:"
+    $hwidContent += "- Hardware IDs are unique identifiers assigned by manufacturers"
+    $hwidContent += "- VID (Vendor ID) identifies the manufacturer"
+    $hwidContent += "- PID (Product ID) identifies the specific product"
+    $hwidContent += "- Historical records may include devices no longer connected"
+    $hwidContent += "- Suspicious patterns: Duplicate HWIDs, generic IDs, missing manufacturer info"
+    $hwidContent += ""
+    
+    # Save HWID report
+    $hwidContent | Out-File -FilePath $hwidPath -Encoding UTF8
+    
+    Write-OperationLog "Hardware ID inventory report saved" "SUCCESS" -Details @{
+        OutputPath = $hwidPath
+        FileSize = (Get-Item $hwidPath).Length
+        Lines = $hwidContent.Count
+    }
+    
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    Write-OperationLog "HARDWARE ID COLLECTION COMPLETE" "SUCCESS"
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    
+    # 4. Collect Log Files
     # Silent collection
     $logFolder = Join-Path $forensicFolder "Logs"
     $null = New-Item -Path $logFolder -ItemType Directory -Force
+    
+    # Security: Check for log tampering before collection
+    $logTamperingSuspicious = @()
+    
+    # Check setupapi.dev.log integrity
+    $setupLogPath = "C:\Windows\inf\setupapi.dev.log"
+    if (Test-Path $setupLogPath) {
+        $setupLog = Get-Item $setupLogPath
+        $logSizeKB = [math]::Round($setupLog.Length / 1KB, 2)
+        
+        # Setup log should be substantial on any used system
+        if ($setupLog.Length -lt 10KB) {
+            $logTamperingSuspicious += "setupapi.dev.log unusually small ($logSizeKB KB) - may have been cleared"
+        }
+        
+        # Check if log was recently modified (beyond normal append operations)
+        $logAge = ((Get-Date) - $setupLog.LastWriteTime).TotalDays
+        if ($logAge -gt 30) {
+            $logTamperingSuspicious += "setupapi.dev.log hasn't been updated in $([math]::Round($logAge)) days - no recent device installations?"
+        }
+    } else {
+        $logTamperingSuspicious += "setupapi.dev.log is missing entirely - highly suspicious on active system"
+    }
+    
+    # Check for Event Log clearing events (Security Event ID 1102, System Event ID 104)
+    try {
+        # Check if Security log was cleared
+        $securityClears = Get-WinEvent -FilterHashtable @{
+            LogName='Security'; ID=1102; StartTime=(Get-Date).AddDays(-90)
+        } -ErrorAction SilentlyContinue -MaxEvents 10
+        
+        if ($securityClears) {
+            $logTamperingSuspicious += "Security event log was cleared $($securityClears.Count) time(s) in last 90 days"
+            foreach ($clear in $securityClears) {
+                $logTamperingSuspicious += "  - Cleared on: $($clear.TimeCreated) by: $($clear.Properties[1].Value)"
+            }
+        }
+        
+        # Check if System log was cleared
+        $systemClears = Get-WinEvent -FilterHashtable @{
+            LogName='System'; ID=104; StartTime=(Get-Date).AddDays(-90)
+        } -ErrorAction SilentlyContinue -MaxEvents 10
+        
+        if ($systemClears) {
+            $logTamperingSuspicious += "System event log was cleared $($systemClears.Count) time(s) in last 90 days"
+        }
+    } catch {
+        # Event log queries can fail, not critical
+    }
+    
+    # Report log tampering findings
+    if ($logTamperingSuspicious.Count -gt 0) {
+        Add-Finding -Category "System" -Severity "HIGH" `
+            -Description "Evidence of log tampering or clearing detected" `
+            -Details @{ 
+                Issues = $logTamperingSuspicious
+                Impact = "Log tampering may indicate attempt to hide evidence of hardware modifications"
+                Recommendation = "Investigate why logs were cleared or are unusually small"
+            }
+        Add-AuditEntry -CheckName "Log Integrity Check" -Status "Completed" `
+            -ItemsScanned 3 -SuspiciousFound $logTamperingSuspicious.Count `
+            -Details @{ TamperingIndicators = $logTamperingSuspicious }
+    }
     
     # Setup API log (device installation history)
     if (Test-Path "C:\Windows\inf\setupapi.dev.log") {
@@ -1753,6 +2611,266 @@ try {
     if (Test-Path "C:\Windows\inf\setupapi.app.log") {
         Copy-Item "C:\Windows\inf\setupapi.app.log" (Join-Path $logFolder "setupapi.app.log") -ErrorAction SilentlyContinue
     }
+    
+    #endregion Log Tampering Detection
+    
+    #region IOMMU/VT-d Detection
+    Write-Progress -Activity "System Analysis" -Status "Check 19/26: IOMMU/VT-d Status" -PercentComplete 73
+    Write-OperationLog "Starting IOMMU/VT-d detection" "INFO"
+    
+    try {
+        $iommuFindings = @()
+        
+        # Check for IOMMU/VT-d capable devices
+        $iommuDevices = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match "IOMMU|VT-d|AMD-Vi|DMAR" -or
+            $_.DeviceID -match "ACPI\\PNP0A08|ACPI\\PNP0A03"  # PCI Express Root Complex
+        }
+        
+        # Check Windows Kernel DMA Protection registry
+        $dmaProtection = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\DmaSecurity" -ErrorAction SilentlyContinue
+        
+        if ($dmaProtection -and $dmaProtection.DmaProtectionEnabled -eq 1) {
+            Write-OperationLog "Kernel DMA Protection is ENABLED" "INFO"
+        } else {
+            $iommuFindings += @{
+                Category = "Kernel DMA Protection Disabled"
+                Severity = "CRITICAL"
+                Evidence = "HKLM:\SYSTEM\CurrentControlSet\Control\DmaSecurity\DmaProtectionEnabled is not set to 1"
+                Impact = "DMA attacks are NOT mitigated by Windows Kernel"
+                Mitigation = "Enable VT-d/AMD-Vi in BIOS, ensure modern UEFI firmware"
+                SuspicionScore = 60
+            }
+            Write-OperationLog "CRITICAL: Kernel DMA Protection is DISABLED - DMA attacks possible" "WARNING"
+        }
+        
+        # Check for Thunderbolt devices (high DMA risk if IOMMU disabled)
+        $thunderboltDevices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.FriendlyName -match "Thunderbolt" -or
+            $_.HardwareID -match "THUNDERBOLT|TBT"
+        }
+        
+        if ($thunderboltDevices -and (-not $dmaProtection -or $dmaProtection.DmaProtectionEnabled -ne 1)) {
+            $iommuFindings += @{
+                Category = "Thunderbolt + No DMA Protection"
+                Severity = "CRITICAL"
+                Evidence = "Thunderbolt controller present but Kernel DMA Protection disabled"
+                Impact = "Thunderbolt ports can be used for DMA attacks"
+                DeviceCount = $thunderboltDevices.Count
+                Mitigation = "Enable Kernel DMA Protection or disable Thunderbolt in BIOS"
+                SuspicionScore = 80
+            }
+            Write-OperationLog "CRITICAL: Thunderbolt detected without DMA protection" "WARNING"
+        }
+        
+        # Check for external PCI/PCIe devices (potential DMA attack vectors)
+        $externalPCIe = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.Class -eq "System" -and
+            ($_.FriendlyName -match "External|Hot.*Plug|Thunderbolt" -or
+             $_.Status -eq "OK" -and $_.ConfigManagerErrorCode -eq 0)
+        }
+        
+        if ($iommuFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "IOMMU/DMA Protection" -Findings $iommuFindings)
+        }
+        
+        Add-AuditEntry -CheckName "IOMMU/VT-d Detection" -Status "Completed" `
+            -ItemsScanned 2 -SuspiciousFound $iommuFindings.Count `
+            -Details @{ 
+                DMAProtectionEnabled = ($dmaProtection.DmaProtectionEnabled -eq 1)
+                ThunderboltDevices = $thunderboltDevices.Count
+                CriticalFindings = $iommuFindings.Count
+            }
+    } catch {
+        Write-OperationLog "Error during IOMMU detection: $_" "ERROR"
+    }
+    #endregion IOMMU/VT-d Detection
+    
+    #region Secure Boot Verification
+    Write-Progress -Activity "System Analysis" -Status "Check 20/26: Secure Boot Status" -PercentComplete 77
+    Write-OperationLog "Starting Secure Boot verification" "INFO"
+    
+    try {
+        $secureBootFindings = @()
+        
+        # Check if Secure Boot is enabled
+        try {
+            $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction Stop
+            
+            if (-not $secureBootEnabled) {
+                $secureBootFindings += @{
+                    Category = "Secure Boot Disabled"
+                    Severity = "HIGH"
+                    Evidence = "Confirm-SecureBootUEFI returned False"
+                    Impact = "System can load unsigned/modified drivers and bootloaders"
+                    Mitigation = "Enable Secure Boot in UEFI/BIOS settings"
+                    SuspicionScore = 50
+                }
+                Write-OperationLog "HIGH: Secure Boot is DISABLED - unsigned drivers can load" "WARNING"
+            } else {
+                Write-OperationLog "Secure Boot is ENABLED" "INFO"
+            }
+        } catch {
+            # Secure Boot not supported or can't be checked
+            $secureBootFindings += @{
+                Category = "Secure Boot Status Unknown"
+                Severity = "MEDIUM"
+                Evidence = "Unable to verify Secure Boot status: $_"
+                Impact = "Cannot confirm boot integrity protection"
+                SuspicionScore = 30
+            }
+            Write-OperationLog "MEDIUM: Unable to verify Secure Boot status" "WARNING"
+        }
+        
+        # Check for UEFI vs Legacy BIOS
+        $firmwareType = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -ErrorAction SilentlyContinue).PEFirmwareType
+        
+        if ($firmwareType -eq 1) {
+            # Legacy BIOS (no Secure Boot possible)
+            $secureBootFindings += @{
+                Category = "Legacy BIOS Mode"
+                Severity = "HIGH"
+                Evidence = "System is using Legacy BIOS (not UEFI)"
+                Impact = "Secure Boot not available, boot process vulnerable to modification"
+                Mitigation = "Convert to UEFI mode if hardware supports it"
+                SuspicionScore = 40
+            }
+            Write-OperationLog "HIGH: System using Legacy BIOS (no Secure Boot support)" "WARNING"
+        }
+        
+        # Check BitLocker status (often disabled when Secure Boot is off)
+        $bitlockerVolumes = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object {
+            $_.VolumeType -eq "OperatingSystem"
+        }
+        
+        if ($bitlockerVolumes) {
+            foreach ($vol in $bitlockerVolumes) {
+                if ($vol.ProtectionStatus -ne "On") {
+                    $secureBootFindings += @{
+                        Category = "BitLocker Disabled on OS Drive"
+                        Severity = "MEDIUM"
+                        Evidence = "OS drive $($vol.MountPoint) has BitLocker disabled"
+                        Impact = "Disk encryption not protecting against offline attacks"
+                        Mitigation = "Enable BitLocker on OS drives"
+                        SuspicionScore = 20
+                    }
+                    Write-OperationLog "MEDIUM: BitLocker disabled on $($vol.MountPoint)" "WARNING"
+                }
+            }
+        }
+        
+        if ($secureBootFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "Secure Boot / Firmware" -Findings $secureBootFindings)
+        }
+        
+        Add-AuditEntry -CheckName "Secure Boot Verification" -Status "Completed" `
+            -ItemsScanned 3 -SuspiciousFound $secureBootFindings.Count `
+            -Details @{ 
+                SecureBootEnabled = $secureBootEnabled
+                FirmwareType = if ($firmwareType -eq 2) { "UEFI" } else { "Legacy BIOS" }
+                CriticalFindings = $secureBootFindings.Count
+            }
+    } catch {
+        Write-OperationLog "Error during Secure Boot verification: $_" "ERROR"
+    }
+    #endregion Secure Boot Verification
+    
+    #region Kernel Driver Enumeration Comparison (DKOM Detection)
+    Write-Progress -Activity "System Analysis" -Status "Check 21/26: Kernel Rootkit Detection (DKOM)" -PercentComplete 81
+    Write-OperationLog "Starting kernel driver enumeration comparison (DKOM detection)" "INFO"
+    
+    try {
+        $dkomFindings = @()
+        
+        # Method 1: CIM query (can be hooked by rootkits)
+        $cimDrivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | 
+                       Where-Object {$_.State -eq "Running"} | 
+                       Select-Object -ExpandProperty Name)
+        
+        # Method 2: Registry enumeration (harder to hook)
+        $regDrivers = @(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\*" -ErrorAction SilentlyContinue | 
+                       Where-Object {$_.Type -eq 1 -and $_.Start -le 2} |  # Type 1 = Kernel driver, Start <= 2 = Auto/Boot
+                       Select-Object -ExpandProperty PSChildName)
+        
+        # Method 3: Filter manager drivers (for filesystem filters)
+        $fltmcOutput = & fltmc.exe 2>&1 | Out-String
+        $filterDrivers = @()
+        if ($fltmcOutput -match "Filter Name") {
+            $filterDrivers = @($fltmcOutput -split "`n" | Where-Object {
+                $_ -match "^\S+" -and $_ -notmatch "Filter Name|Instances|-----"
+            } | ForEach-Object {
+                ($_ -split "\s+")[0]
+            })
+        }
+        
+        Write-OperationLog "Driver count - CIM: $($cimDrivers.Count), Registry: $($regDrivers.Count), FilterMgr: $($filterDrivers.Count)" "INFO"
+        
+        # Compare counts - significant mismatch indicates hiding
+        $countDifference = [Math]::Abs($cimDrivers.Count - $regDrivers.Count)
+        
+        if ($countDifference -gt 5) {
+            $dkomFindings += @{
+                Category = "Driver Enumeration Mismatch"
+                Severity = "CRITICAL"
+                Evidence = "CIM reports $($cimDrivers.Count) drivers, Registry shows $($regDrivers.Count) drivers (difference: $countDifference)"
+                Impact = "Possible kernel rootkit using Direct Kernel Object Manipulation (DKOM)"
+                Mitigation = "Perform offline scan with bootable antivirus, check for known rootkits"
+                SuspicionScore = 90
+            }
+            Write-OperationLog "CRITICAL: Driver enumeration mismatch detected - possible DKOM rootkit!" "WARNING"
+        }
+        
+        # Find drivers in registry but not in CIM (hidden drivers)
+        $hiddenDrivers = @($regDrivers | Where-Object {$_ -notin $cimDrivers})
+        
+        if ($hiddenDrivers.Count -gt 0) {
+            $dkomFindings += @{
+                Category = "Hidden Drivers Detected"
+                Severity = "CRITICAL"
+                Evidence = "Found $($hiddenDrivers.Count) drivers in Registry but not visible via CIM"
+                HiddenDriverList = ($hiddenDrivers -join ", ")
+                Impact = "Drivers are hiding from standard enumeration - rootkit behavior"
+                SuspicionScore = 95
+            }
+            Write-OperationLog "CRITICAL: Hidden drivers detected: $($hiddenDrivers -join ', ')" "WARNING"
+        }
+        
+        # Check for suspicious filter drivers (common in rootkits)
+        $suspiciousFilters = @($filterDrivers | Where-Object {
+            $_ -notmatch "^(luafv|wcifs|FileCrypt|storqosflt|wcnfs|bindflat|FileInfo|npsvctrig|Wof|FileCrypt|CldFlt)$" -and
+            $_ -match "[a-z]{6,}" -and  # Unusual naming pattern
+            $_ -notmatch "^(Microsoft|Windows|WdFilter|SysmonDrv)"
+        })
+        
+        if ($suspiciousFilters.Count -gt 0) {
+            $dkomFindings += @{
+                Category = "Suspicious Filesystem Filters"
+                Severity = "HIGH"
+                Evidence = "Unusual filter drivers detected: $($suspiciousFilters -join ', ')"
+                Impact = "Unknown filters can intercept file operations, hide files, or modify data"
+                FilterCount = $suspiciousFilters.Count
+                SuspicionScore = 60
+            }
+            Write-OperationLog "HIGH: Suspicious filter drivers: $($suspiciousFilters -join ', ')" "WARNING"
+        }
+        
+        if ($dkomFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "Kernel Rootkit Detection (DKOM)" -Findings $dkomFindings)
+        }
+        
+        Add-AuditEntry -CheckName "DKOM Detection" -Status "Completed" `
+            -ItemsScanned 3 -SuspiciousFound $dkomFindings.Count `
+            -Details @{ 
+                CIMDriverCount = $cimDrivers.Count
+                RegistryDriverCount = $regDrivers.Count
+                FilterDriverCount = $filterDrivers.Count
+                HiddenDrivers = $hiddenDrivers.Count
+                CriticalFindings = $dkomFindings.Count
+            }
+    } catch {
+        Write-OperationLog "Error during DKOM detection: $_" "ERROR"
+    }
+    #endregion Kernel Driver Enumeration Comparison
     
     # Event logs (last 7 days)
     # Silent collection
@@ -1775,6 +2893,1114 @@ try {
     Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4697,4698,4699; StartTime=$sevenDaysAgo} -ErrorAction SilentlyContinue |
         Select-Object TimeCreated, Id, Message |
         Export-Csv (Join-Path $eventLogPath "Security_DriverEvents.csv") -NoTypeInformation
+    
+    #region HVCI/Memory Integrity Checks
+    Write-Progress -Activity "System Analysis" -Status "Check 22/26: Memory Integrity (HVCI)" -PercentComplete 85
+    Write-OperationLog "Starting HVCI/Memory Integrity verification" "INFO"
+    
+    try {
+        $hvciFindings = @()
+        
+        # Check Device Guard / HVCI status via CIM
+        $deviceGuard = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction SilentlyContinue
+        
+        if ($deviceGuard) {
+            # Check Code Integrity Policy Enforcement
+            if ($deviceGuard.CodeIntegrityPolicyEnforcementStatus -ne 1) {
+                $hvciFindings += @{
+                    Category = "Hypervisor Code Integrity (HVCI) Disabled"
+                    Severity = "HIGH"
+                    Evidence = "CodeIntegrityPolicyEnforcementStatus = $($deviceGuard.CodeIntegrityPolicyEnforcementStatus) (expected: 1)"
+                    Impact = "Memory-based attacks (process injection, kernel exploitation) not mitigated"
+                    Mitigation = "Enable Memory Integrity in Windows Security > Device Security > Core Isolation"
+                    SuspicionScore = 45
+                }
+                Write-OperationLog "HIGH: HVCI/Memory Integrity is DISABLED" "WARNING"
+            } else {
+                Write-OperationLog "HVCI/Memory Integrity is ENABLED" "INFO"
+            }
+            
+            # Check if VBS (Virtualization-Based Security) is running
+            if ($deviceGuard.VirtualizationBasedSecurityStatus -ne 2) {
+                $hvciFindings += @{
+                    Category = "Virtualization-Based Security Not Running"
+                    Severity = "MEDIUM"
+                    Evidence = "VirtualizationBasedSecurityStatus = $($deviceGuard.VirtualizationBasedSecurityStatus) (expected: 2)"
+                    Impact = "Hardware-based security features not active"
+                    SuspicionScore = 30
+                }
+                Write-OperationLog "MEDIUM: VBS is not running" "WARNING"
+            }
+        } else {
+            $hvciFindings += @{
+                Category = "Device Guard Status Unknown"
+                Severity = "MEDIUM"
+                Evidence = "Unable to query Win32_DeviceGuard CIM class"
+                Impact = "Cannot verify hardware-based security status"
+                SuspicionScore = 25
+            }
+            Write-OperationLog "MEDIUM: Cannot query Device Guard status" "WARNING"
+        }
+        
+        # Check for Code Integrity violations in event log
+        $codeIntegrityViolations = Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-CodeIntegrity/Operational'
+            Id = 3076,3077  # Driver load blocked by code integrity
+            StartTime = (Get-Date).AddDays(-30)
+        } -ErrorAction SilentlyContinue
+        
+        if ($codeIntegrityViolations -and $codeIntegrityViolations.Count -gt 0) {
+            # Extract unique driver names from violations
+            $blockedDrivers = @($codeIntegrityViolations | ForEach-Object {
+                if ($_.Message -match "\\([^\\]+\.sys)") {
+                    $matches[1]
+                }
+            } | Select-Object -Unique)
+            
+            $hvciFindings += @{
+                Category = "Unsigned Driver Load Attempts"
+                Severity = "CRITICAL"
+                Evidence = "Detected $($codeIntegrityViolations.Count) driver load attempts blocked by Code Integrity (last 30 days)"
+                BlockedDrivers = ($blockedDrivers -join ", ")
+                Impact = "System is being targeted with unsigned/malicious drivers"
+                ViolationCount = $codeIntegrityViolations.Count
+                SuspicionScore = 85
+            }
+            Write-OperationLog "CRITICAL: $($codeIntegrityViolations.Count) unsigned driver load attempts detected!" "WARNING"
+        }
+        
+        # Check for Credential Guard status
+        if ($deviceGuard -and $deviceGuard.SecurityServicesRunning -notcontains 2) {
+            $hvciFindings += @{
+                Category = "Credential Guard Not Running"
+                Severity = "LOW"
+                Evidence = "Credential Guard is not active"
+                Impact = "Credentials may be vulnerable to memory dumping attacks"
+                SuspicionScore = 15
+            }
+        }
+        
+        if ($hvciFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "Memory Integrity / HVCI" -Findings $hvciFindings)
+        }
+        
+        Add-AuditEntry -CheckName "HVCI/Memory Integrity" -Status "Completed" `
+            -ItemsScanned 4 -SuspiciousFound $hvciFindings.Count `
+            -Details @{ 
+                HVCIEnabled = ($deviceGuard.CodeIntegrityPolicyEnforcementStatus -eq 1)
+                VBSRunning = ($deviceGuard.VirtualizationBasedSecurityStatus -eq 2)
+                CodeIntegrityViolations = if ($codeIntegrityViolations) { $codeIntegrityViolations.Count } else { 0 }
+                CriticalFindings = $hvciFindings.Count
+            }
+    } catch {
+        Write-OperationLog "Error during HVCI verification: $_" "ERROR"
+    }
+    #endregion HVCI/Memory Integrity Checks
+    
+    #region PCILeech-Specific Detection
+    Write-Progress -Activity "System Analysis" -Status "Check 23/26: PCILeech Indicators" -PercentComplete 88
+    Write-OperationLog "Starting PCILeech-specific detection" "INFO"
+    
+    try {
+        $pcileechFindings = @()
+        
+        # Check for PCILeech driver (various names)
+        $pcileechDriverNames = @('pcileech', 'screamer', 'dmascreamer', 'fpga')
+        $suspiciousDrivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object {
+            $driver = $_
+            $pcileechDriverNames | Where-Object {$driver.Name -match $_ -or $driver.PathName -match $_}
+        })
+        
+        if ($suspiciousDrivers.Count -gt 0) {
+            $pcileechFindings += @{
+                Category = "PCILeech Driver Detected"
+                Severity = "CRITICAL"
+                Evidence = "Found driver(s) matching PCILeech signatures: $($suspiciousDrivers.Name -join ', ')"
+                DriverPaths = ($suspiciousDrivers.PathName -join '; ')
+                Impact = "PCILeech DMA attack tool is installed"
+                SuspicionScore = 100
+            }
+            Write-OperationLog "CRITICAL: PCILeech driver detected: $($suspiciousDrivers.Name -join ', ')" "WARNING"
+        }
+        
+        # Check for FPGA development boards (Xilinx 7-Series, Altera, etc.)
+        $fpgaDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            ($_.FriendlyName -match "Xilinx|Altera|Lattice|FPGA|7-Series|Artix|Kintex|Virtex" -or
+             $_.HardwareID -match "VEN_10EE") -and  # Xilinx vendor ID
+            $_.Class -ne "Display"  # Exclude GPUs that use FPGA tech
+        })
+        
+        if ($fpgaDevices.Count -gt 0) {
+            $pcileechFindings += @{
+                Category = "FPGA Development Board Detected"
+                Severity = "HIGH"
+                Evidence = "FPGA device(s) detected: $($fpgaDevices.FriendlyName -join ', ')"
+                DeviceIDs = ($fpgaDevices.InstanceId -join '; ')
+                Impact = "FPGA boards are commonly used for DMA attacks (PCILeech hardware)"
+                DeviceCount = $fpgaDevices.Count
+                SuspicionScore = 75
+            }
+            Write-OperationLog "HIGH: FPGA development board detected: $($fpgaDevices.FriendlyName -join ', ')" "WARNING"
+        }
+        
+        # Check for excessive memory-mapped I/O regions (sign of DMA activity)
+        $memoryRegions = @(Get-CimInstance Win32_DeviceMemoryAddress -ErrorAction SilentlyContinue)
+        
+        if ($memoryRegions.Count -gt 150) {
+            $pcileechFindings += @{
+                Category = "Excessive Memory-Mapped I/O Regions"
+                Severity = "MEDIUM"
+                Evidence = "Found $($memoryRegions.Count) memory-mapped I/O regions (normal: <100)"
+                Impact = "May indicate DMA hardware accessing system memory"
+                RegionCount = $memoryRegions.Count
+                SuspicionScore = 40
+            }
+            Write-OperationLog "MEDIUM: Excessive memory-mapped I/O regions: $($memoryRegions.Count)" "WARNING"
+        }
+        
+        # Check for PCIe hotplug activity (DMA cards often appear as hot-pluggable)
+        $hotplugDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.Capabilities -match "Removable" -and
+            $_.Class -in @("System", "Unknown") -and
+            $_.InstanceId -match "PCI"
+        })
+        
+        if ($hotplugDevices.Count -gt 2) {
+            $pcileechFindings += @{
+                Category = "Suspicious Hot-Pluggable PCI Devices"
+                Severity = "MEDIUM"
+                Evidence = "Found $($hotplugDevices.Count) hot-pluggable PCI devices"
+                Devices = ($hotplugDevices.FriendlyName -join ', ')
+                Impact = "DMA attack hardware often appears as hot-pluggable PCI devices"
+                SuspicionScore = 35
+            }
+            Write-OperationLog "MEDIUM: Suspicious hot-pluggable PCI devices: $($hotplugDevices.Count)" "WARNING"
+        }
+        
+        # Check for Xilinx Platform Cable USB (used to program FPGA boards)
+        $xilinxCable = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.FriendlyName -match "Xilinx.*Platform.*Cable|Digilent.*JTAG" -or
+            $_.HardwareID -match "VID_03FD"  # Xilinx USB vendor ID
+        })
+        
+        if ($xilinxCable.Count -gt 0) {
+            $pcileechFindings += @{
+                Category = "FPGA Programming Interface Detected"
+                Severity = "HIGH"
+                Evidence = "Xilinx/Digilent programming cable detected: $($xilinxCable.FriendlyName -join ', ')"
+                Impact = "Tool for programming FPGA-based DMA attack hardware"
+                SuspicionScore = 70
+            }
+            Write-OperationLog "HIGH: FPGA programming cable detected" "WARNING"
+        }
+        
+        if ($pcileechFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "PCILeech-Specific Indicators" -Findings $pcileechFindings)
+        }
+        
+        Add-AuditEntry -CheckName "PCILeech Detection" -Status "Completed" `
+            -ItemsScanned 5 -SuspiciousFound $pcileechFindings.Count `
+            -Details @{ 
+                PCILeechDrivers = $suspiciousDrivers.Count
+                FPGADevices = $fpgaDevices.Count
+                MemoryRegions = $memoryRegions.Count
+                CriticalFindings = ($pcileechFindings | Where-Object {$_.Severity -eq "CRITICAL"}).Count
+            }
+    } catch {
+        Write-OperationLog "Error during PCILeech detection: $_" "ERROR"
+    }
+    #endregion PCILeech-Specific Detection
+    
+    #region Baseline Comparison
+    Write-Progress -Activity "System Analysis" -Status "Check 24/26: Baseline Comparison" -PercentComplete 92
+    Write-OperationLog "Starting baseline comparison" "INFO"
+    
+    try {
+        $baselineFindings = Compare-ToBaseline
+        
+        if ($baselineFindings) {
+            if ($baselineFindings -is [Array]) {
+                foreach ($finding in $baselineFindings) {
+                    if ($finding.Severity -ne "INFO") {
+                        [void](Report-ScoredFinding -Category "Baseline Comparison" -Findings @($finding))
+                    }
+                }
+                Add-AuditEntry -CheckName "Baseline Comparison" -Status "Completed" `
+                    -ItemsScanned 1 -SuspiciousFound $baselineFindings.Count `
+                    -Details @{ BaselineFindings = $baselineFindings.Count }
+            } else {
+                if ($baselineFindings.Severity -eq "INFO") {
+                    Write-OperationLog "No baseline found - create with Export-SystemBaseline" "INFO"
+                } else {
+                    [void](Report-ScoredFinding -Category "Baseline Comparison" -Findings @($baselineFindings))
+                }
+                Add-AuditEntry -CheckName "Baseline Comparison" -Status "Completed" `
+                    -ItemsScanned 1 -SuspiciousFound 0 `
+                    -Details @{ Message = $baselineFindings.Evidence }
+            }
+        }
+    } catch {
+        Write-OperationLog "Error during baseline comparison: $_" "ERROR"
+    }
+    #endregion Baseline Comparison
+    
+    #region Network-Based Indicators
+    Write-Progress -Activity "System Analysis" -Status "Check 25/26: Network Indicators" -PercentComplete 96
+    Write-OperationLog "Starting network-based indicator detection" "INFO"
+    
+    try {
+        $networkFindings = @()
+        
+        # Check DNS cache for suspicious domains
+        $suspiciousDomainPatterns = @(
+            "*cheat*", "*hack*", "*aimbot*", "*wallhack*", "*esp*",
+            "*dma*card*", "*pcileech*", "*screamer*", "*kernel*cheat*"
+        )
+        
+        $dnsCache = Get-DnsClientCache -ErrorAction SilentlyContinue | Where-Object {
+            $entry = $_.Entry
+            $suspiciousDomainPatterns | Where-Object {$entry -like $_}
+        }
+        
+        if ($dnsCache) {
+            $networkFindings += @{
+                Category = "Suspicious DNS Cache Entries"
+                Severity = "HIGH"
+                Evidence = "Found DNS lookups for cheat/hack-related domains"
+                DomainList = ($dnsCache.Entry -join ", ")
+                Impact = "User may have accessed cheat provider websites"
+                DomainCount = $dnsCache.Count
+                SuspicionScore = 70
+            }
+            Write-OperationLog "HIGH: Suspicious DNS cache entries: $($dnsCache.Entry -join ', ')" "WARNING"
+        }
+        
+        # Check for unusual active connections (non-standard ports)
+        $connections = Get-NetTCPConnection -ErrorAction SilentlyContinue | Where-Object {
+            $_.State -eq "Established" -and
+            $_.RemotePort -notin @(80, 443, 53, 22, 3389, 445, 139) -and  # Common legitimate ports
+            $_.RemoteAddress -notmatch "^(127\.|::1|169\.254\.)" # Not localhost/link-local
+        }
+        
+        if ($connections.Count -gt 20) {
+            $unusualConnections = $connections | Group-Object RemotePort | 
+                                 Where-Object {$_.Count -gt 2} | 
+                                 Sort-Object Count -Descending | 
+                                 Select-Object -First 5
+            
+            if ($unusualConnections) {
+                $networkFindings += @{
+                    Category = "Unusual Network Connections"
+                    Severity = "MEDIUM"
+                    Evidence = "Multiple connections to non-standard ports"
+                    TopPorts = ($unusualConnections | ForEach-Object {"Port $($_.Name): $($_.Count) connections"}) -join "; "
+                    Impact = "May indicate C2 communication or cheat software updates"
+                    ConnectionCount = $connections.Count
+                    SuspicionScore = 35
+                }
+                Write-OperationLog "MEDIUM: Unusual network connections detected: $($connections.Count) total" "WARNING"
+            }
+        }
+        
+        # Check for connections from suspicious processes
+        $suspiciousProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessName -match "injector|loader|bypass|hook|cheat" -or
+            ($_.Path -and $_.Path -match "temp|appdata\\local\\temp")
+        }
+        
+        if ($suspiciousProcesses) {
+            foreach ($proc in $suspiciousProcesses) {
+                $procConnections = Get-NetTCPConnection -ErrorAction SilentlyContinue | 
+                                  Where-Object {$_.OwningProcess -eq $proc.Id -and $_.State -eq "Established"}
+                
+                if ($procConnections) {
+                    $networkFindings += @{
+                        Category = "Suspicious Process Network Activity"
+                        Severity = "HIGH"
+                        Evidence = "Process '$($proc.ProcessName)' has active network connections"
+                        ProcessPath = $proc.Path
+                        RemoteAddresses = ($procConnections.RemoteAddress | Select-Object -Unique -join ", ")
+                        SuspicionScore = 65
+                    }
+                    Write-OperationLog "HIGH: Suspicious process with network activity: $($proc.ProcessName)" "WARNING"
+                }
+            }
+        }
+        
+        if ($networkFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "Network Indicators" -Findings $networkFindings)
+        }
+        
+        Add-AuditEntry -CheckName "Network Indicators" -Status "Completed" `
+            -ItemsScanned 3 -SuspiciousFound $networkFindings.Count `
+            -Details @{
+                SuspiciousDNS = if ($dnsCache) { $dnsCache.Count } else { 0 }
+                UnusualConnections = $connections.Count
+                CriticalFindings = $networkFindings.Count
+            }
+    } catch {
+        Write-OperationLog "Error during network indicator detection: $_" "ERROR"
+    }
+    #endregion Network-Based Indicators
+    
+    #region Boot Configuration Checks
+    Write-Progress -Activity "System Analysis" -Status "Check 26/26: Boot Configuration" -PercentComplete 100
+    Write-OperationLog "Starting boot configuration checks (bcdedit)" "INFO"
+    
+    try {
+        $bootFindings = @()
+        
+        # Run bcdedit to check for dangerous boot flags
+        $bcdeditOutput = & bcdedit.exe /enum all 2>&1 | Out-String
+        
+        # Check for test signing enabled (allows unsigned drivers)
+        if ($bcdeditOutput -match "testsigning\s+Yes") {
+            $bootFindings += @{
+                Category = "Test Signing Enabled"
+                Severity = "CRITICAL"
+                Evidence = "Boot configuration has 'testsigning Yes' - unsigned drivers can load"
+                Impact = "System will load unsigned/malicious drivers without warnings"
+                Mitigation = "Run: bcdedit /set testsigning off"
+                SuspicionScore = 95
+            }
+            Write-OperationLog "CRITICAL: Test signing is ENABLED - unsigned drivers allowed!" "WARNING"
+        }
+        
+        # Check for integrity checks disabled
+        if ($bcdeditOutput -match "nointegritychecks\s+(Yes|On)") {
+            $bootFindings += @{
+                Category = "Integrity Checks Disabled"
+                Severity = "CRITICAL"
+                Evidence = "Boot configuration has 'nointegritychecks' enabled"
+                Impact = "Kernel code signing checks are bypassed"
+                Mitigation = "Run: bcdedit /deletevalue nointegritychecks"
+                SuspicionScore = 95
+            }
+            Write-OperationLog "CRITICAL: Kernel integrity checks DISABLED!" "WARNING"
+        }
+        
+        # Check for debug mode enabled
+        if ($bcdeditOutput -match "debug\s+Yes") {
+            $bootFindings += @{
+                Category = "Kernel Debugging Enabled"
+                Severity = "HIGH"
+                Evidence = "Boot configuration has 'debug Yes'"
+                Impact = "Kernel can be debugged/modified at runtime"
+                Mitigation = "Run: bcdedit /set debug off (unless actively debugging)"
+                SuspicionScore = 60
+            }
+            Write-OperationLog "HIGH: Kernel debugging enabled" "WARNING"
+        }
+        
+        # Check for DISABLE_INTEGRITY_CHECKS
+        if ($bcdeditOutput -match "DISABLE_INTEGRITY_CHECKS") {
+            $bootFindings += @{
+                Category = "Driver Signing Enforcement Disabled"
+                Severity = "CRITICAL"
+                Evidence = "Boot option DISABLE_INTEGRITY_CHECKS detected"
+                Impact = "All driver signature verification is disabled"
+                SuspicionScore = 98
+            }
+            Write-OperationLog "CRITICAL: Driver signing enforcement disabled!" "WARNING"
+        }
+        
+        # Check for hypervisorlaunchtype disabled (needed for VBS/HVCI)
+        if ($bcdeditOutput -match "hypervisorlaunchtype\s+(Off|disabled)") {
+            $bootFindings += @{
+                Category = "Hypervisor Disabled"
+                Severity = "MEDIUM"
+                Evidence = "Hypervisor launch type is disabled"
+                Impact = "Virtualization-based security (VBS/HVCI) cannot function"
+                Mitigation = "Run: bcdedit /set hypervisorlaunchtype auto"
+                SuspicionScore = 40
+            }
+            Write-OperationLog "MEDIUM: Hypervisor disabled - VBS unavailable" "WARNING"
+        }
+        
+        if ($bootFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "Boot Configuration" -Findings $bootFindings)
+        }
+        
+        Add-AuditEntry -CheckName "Boot Configuration" -Status "Completed" `
+            -ItemsScanned 5 -SuspiciousFound $bootFindings.Count `
+            -Details @{
+                CriticalFindings = ($bootFindings | Where-Object {$_.Severity -eq "CRITICAL"}).Count
+                HighFindings = ($bootFindings | Where-Object {$_.Severity -eq "HIGH"}).Count
+            }
+    } catch {
+        Write-OperationLog "Error during boot configuration checks: $_" "ERROR"
+    }
+    #endregion Boot Configuration Checks
+    
+    #region Hardware Behavior Analysis
+    Write-Progress -Activity "System Analysis" -Status "Check 27/29: Hardware Behavior Patterns" -PercentComplete 93
+    
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    Write-OperationLog "CHECK 27/29: HARDWARE BEHAVIOR ANALYSIS" "INFO"
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    Write-OperationLog "Starting hardware behavior analysis" "INFO"
+    
+    try {
+        $behaviorFindings = @()
+        
+        # Monitor memory access patterns via performance counters
+        try {
+            Write-OperationLog "Querying performance counters for memory metrics" "QUERY" -Details @{
+                Counters = "\Memory\Pages/sec, \Memory\Available MBytes, \Memory\Cache Bytes, \Memory\Pool Nonpaged Bytes"
+            }
+            
+            $memCounters = Get-Counter -Counter @(
+                "\Memory\Pages/sec",
+                "\Memory\Available MBytes",
+                "\Memory\Cache Bytes",
+                "\Memory\Pool Nonpaged Bytes"
+            ) -ErrorAction SilentlyContinue
+            
+            # High page fault rate can indicate DMA thrashing
+            $pagesPerSec = ($memCounters.CounterSamples | Where-Object {$_.Path -match "Pages/sec"}).CookedValue
+            $availableMB = ($memCounters.CounterSamples | Where-Object {$_.Path -match "Available MBytes"}).CookedValue
+            
+            Write-OperationLog "Performance counters collected" "SUCCESS" -Details @{
+                PagesPerSec = [math]::Round($pagesPerSec, 2)
+                AvailableMB = [math]::Round($availableMB, 2)
+                Threshold = 1000
+            }
+            
+            if ($pagesPerSec -gt 1000) {
+                $behaviorFindings += @{
+                    Category = "Excessive Memory Paging"
+                    Severity = "MEDIUM"
+                    Evidence = "Memory pages/sec: $([math]::Round($pagesPerSec, 2)) (normal: <500)"
+                    Impact = "May indicate DMA device accessing memory aggressively"
+                    SuspicionScore = 35
+                }
+                Write-OperationLog "MEDIUM: High memory paging rate detected" "FINDING" -Details @{
+                    PagesPerSec = [math]::Round($pagesPerSec, 2)
+                    SuspicionScore = 35
+                }
+            }
+        } catch {
+            Write-OperationLog "Could not query memory performance counters" "WARNING" -Details @{
+                Exception = $_.Exception.Message
+            }
+        }
+        
+        # Check for devices with excessive IRQ (Interrupt Request) allocations
+        Write-OperationLog "Querying Win32_PnPAllocatedResource for IRQ analysis" "QUERY"
+        
+        $irqResources = Get-CimInstance Win32_PnPAllocatedResource -ErrorAction SilentlyContinue | Where-Object {
+            $_.ResourceType -eq 4  # IRQ resource type
+        }
+        
+        Write-OperationLog "IRQ resources collected" "SUCCESS" -Details @{
+            TotalIRQAllocations = $irqResources.Count
+        }
+        
+        if ($irqResources) {
+            # Group by device, count IRQs per device
+            $irqByDevice = $irqResources | Group-Object -Property Dependent | Where-Object {
+                $_.Count -gt 8  # Normal devices use 1-4 IRQs, suspicious if >8
+            }
+            
+            foreach ($deviceGroup in $irqByDevice) {
+                # Extract device instance ID from CIM path
+                if ($deviceGroup.Name -match 'DeviceID="([^"]+)"') {
+                    $deviceId = $matches[1]
+                    $device = Get-CachedPnpDevices | Where-Object {$_.InstanceId -eq $deviceId} | Select-Object -First 1
+                    
+                    if ($device -and $device.Class -ne "Display") {  # GPUs legitimately use many IRQs
+                        $behaviorFindings += @{
+                            Category = "Excessive IRQ Allocation"
+                            Severity = "MEDIUM"
+                            Evidence = "Device '$($device.FriendlyName)' allocated $($deviceGroup.Count) IRQ lines (normal: 1-4)"
+                            DeviceID = $deviceId
+                            Impact = "High interrupt rate typical of DMA devices performing rapid memory access"
+                            SuspicionScore = 40
+                        }
+                        Write-OperationLog "MEDIUM: Device with excessive IRQs: $($device.FriendlyName)" "WARNING"
+                    }
+                }
+            }
+        }
+        
+        # Check for devices accessing high memory addresses (>4GB) - unusual for non-GPU PCIe devices
+        $memoryAddresses = Get-CimInstance Win32_DeviceMemoryAddress -ErrorAction SilentlyContinue
+        
+        if ($memoryAddresses) {
+            $highMemDevices = @($memoryAddresses | Where-Object {
+                try {
+                    # Convert hex address to int64
+                    $endAddr = [Convert]::ToInt64($_.EndingAddress, 16)
+                    # Check if accessing above 4GB (0x100000000)
+                    $endAddr -gt 4294967296 -and $_.Name -notmatch "Display|Video|GPU|Graphics"
+                } catch {
+                    $false
+                }
+            })
+            
+            foreach ($mem in $highMemDevices) {
+                $behaviorFindings += @{
+                    Category = "High Memory Access Pattern"
+                    Severity = "MEDIUM"
+                    Evidence = "Device '$($mem.Name)' accessing memory above 4GB (ending: 0x$($mem.EndingAddress))"
+                    Impact = "Non-GPU devices rarely need >4GB addressing - potential DMA scanning all memory"
+                    MemoryRange = "0x$($mem.StartingAddress) - 0x$($mem.EndingAddress)"
+                    SuspicionScore = 45
+                }
+                Write-OperationLog "MEDIUM: High memory access by: $($mem.Name)" "WARNING"
+            }
+        }
+        
+        # Check for PCIe devices with unusually large BAR (Base Address Register) sizes
+        # DMA devices often request large memory-mapped regions
+        $pciDevices = Get-CachedPciDevices
+        $largeBarDevices = @()
+        
+        foreach ($device in $pciDevices) {
+            # Get all memory resources for this device
+            $deviceMemory = $memoryAddresses | Where-Object {$_.Name -eq $device.FriendlyName}
+            
+            if ($deviceMemory) {
+                foreach ($mem in $deviceMemory) {
+                    try {
+                        $start = [Convert]::ToInt64($mem.StartingAddress, 16)
+                        $end = [Convert]::ToInt64($mem.EndingAddress, 16)
+                        $size = $end - $start
+                        
+                        # BAR size >256MB is unusual for non-GPU devices
+                        if ($size -gt 268435456 -and $device.Class -ne "Display") {
+                            $largeBarDevices += @{
+                                Device = $device.FriendlyName
+                                SizeMB = [math]::Round($size / 1MB, 2)
+                                Range = "0x$($mem.StartingAddress) - 0x$($mem.EndingAddress)"
+                            }
+                        }
+                    } catch {
+                        # Skip devices with invalid addresses
+                    }
+                }
+            }
+        }
+        
+        if ($largeBarDevices.Count -gt 0) {
+            $behaviorFindings += @{
+                Category = "Large Memory-Mapped I/O Regions"
+                Severity = "MEDIUM"
+                Evidence = "Found $($largeBarDevices.Count) non-GPU device(s) with >256MB memory regions"
+                Devices = ($largeBarDevices | ForEach-Object {"$($_.Device): $($_.SizeMB) MB"}) -join "; "
+                Impact = "Large BARs allow device to access significant memory ranges - DMA attack vector"
+                SuspicionScore = 50
+            }
+            Write-OperationLog "MEDIUM: Large BAR devices detected: $($largeBarDevices.Count)" "WARNING"
+        }
+        
+        # Check for devices with DMA capabilities explicitly enabled
+        $dmaCapableDevices = @(Get-CachedPnpDevices | Where-Object {
+            $_.Capabilities -match "DMA" -or
+            $_.ConfigManagerErrorCode -eq 0 -and  # Working properly
+            ($_.InstanceId -match "PCI" -and $_.Class -in @("System", "Unknown", "Other"))
+        })
+        
+        if ($dmaCapableDevices.Count -gt 5) {
+            # More than 5 unknown/system PCI devices with potential DMA is suspicious
+            $behaviorFindings += @{
+                Category = "Multiple DMA-Capable System Devices"
+                Severity = "MEDIUM"
+                Evidence = "Found $($dmaCapableDevices.Count) PCI devices in System/Unknown class with DMA capability"
+                Impact = "Legitimate systems typically have 2-4 such devices; excess may indicate attack hardware"
+                DeviceCount = $dmaCapableDevices.Count
+                SuspicionScore = 35
+            }
+            Write-OperationLog "MEDIUM: Multiple DMA-capable devices: $($dmaCapableDevices.Count)" "WARNING"
+        }
+        
+        if ($behaviorFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "Hardware Behavior Analysis" -Findings $behaviorFindings)
+        }
+        
+        Add-AuditEntry -CheckName "Hardware Behavior Analysis" -Status "Completed" `
+            -ItemsScanned 6 -SuspiciousFound $behaviorFindings.Count `
+            -Details @{
+                MemoryPageRate = if ($pagesPerSec) { [math]::Round($pagesPerSec, 2) } else { "N/A" }
+                HighIRQDevices = ($irqByDevice | Measure-Object).Count
+                HighMemoryDevices = $highMemDevices.Count
+                LargeBARDevices = $largeBarDevices.Count
+                DMACapableDevices = $dmaCapableDevices.Count
+            }
+    } catch {
+        Write-OperationLog "Error during hardware behavior analysis: $_" "ERROR"
+    }
+    #endregion Hardware Behavior Analysis
+    
+    #region UEFI Integrity Checking
+    Write-Progress -Activity "System Analysis" -Status "Check 28/29: UEFI Integrity Verification" -PercentComplete 96
+    Write-OperationLog "Starting UEFI integrity checks" "INFO"
+    
+    try {
+        $uefiFindings = @()
+        
+        # Check if system supports UEFI
+        $firmwareType = (Get-ComputerInfo).BiosFirmwareType
+        
+        if ($firmwareType -ne "Uefi") {
+            Write-OperationLog "System uses legacy BIOS, skipping UEFI checks" "INFO"
+            Add-AuditEntry -CheckName "UEFI Integrity" -Status "Skipped" `
+                -ItemsScanned 0 -SuspiciousFound 0 `
+                -Details @{ Reason = "Legacy BIOS system" }
+        } else {
+            Write-OperationLog "UEFI firmware detected, performing integrity checks" "INFO"
+            
+            # 1. Locate and scan EFI System Partition (ESP)
+            try {
+                $espPartitions = Get-Partition | Where-Object {
+                    $_.GptType -eq "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}"  # EFI System Partition GUID
+                }
+                
+                foreach ($esp in $espPartitions) {
+                    try {
+                        # Temporarily assign drive letter if not present
+                        $hadLetter = $esp.DriveLetter
+                        
+                        if (-not $hadLetter) {
+                            $availableLetter = (68..90 | ForEach-Object {[char]$_} | Where-Object {
+                                (Get-Volume -DriveLetter $_ -ErrorAction SilentlyContinue) -eq $null
+                            })[0]
+                            
+                            $esp | Set-Partition -NewDriveLetter $availableLetter
+                            $espDrive = "${availableLetter}:"
+                        } else {
+                            $espDrive = "$($esp.DriveLetter):"
+                        }
+                        
+                        # Scan for .efi files
+                        $efiFiles = Get-ChildItem -Path "$espDrive\EFI" -Filter "*.efi" -Recurse -ErrorAction SilentlyContinue
+                        
+                        $unsignedEfiFiles = @()
+                        $suspiciousNames = @("pcileech", "dma", "kernel", "exploit", "inject", "loader")
+                        
+                        foreach ($efiFile in $efiFiles) {
+                            # Check digital signature
+                            $sig = Get-AuthenticodeSignature -FilePath $efiFile.FullName -ErrorAction SilentlyContinue
+                            
+                            if ($sig.Status -ne "Valid") {
+                                $unsignedEfiFiles += @{
+                                    Path = $efiFile.FullName.Replace($espDrive, "ESP:")
+                                    Name = $efiFile.Name
+                                    SignatureStatus = $sig.Status
+                                    SizeMB = [math]::Round($efiFile.Length / 1MB, 2)
+                                }
+                                
+                                # Extra scrutiny for suspicious names
+                                $isSuspiciousName = $suspiciousNames | Where-Object {$efiFile.Name -match $_}
+                                
+                                if ($isSuspiciousName) {
+                                    $uefiFindings += @{
+                                        Category = "Suspicious UEFI Executable"
+                                        Severity = "HIGH"
+                                        Evidence = "Unsigned/invalid EFI file with suspicious name: $($efiFile.FullName)"
+                                        SignatureStatus = $sig.Status
+                                        Impact = "UEFI-level malware/rootkit can hide DMA devices from OS detection"
+                                        SuspicionScore = 85
+                                    }
+                                    Write-OperationLog "HIGH: Suspicious EFI file: $($efiFile.Name)" "WARNING"
+                                }
+                            }
+                        }
+                        
+                        if ($unsignedEfiFiles.Count -gt 3) {
+                            # Most systems have 0-2 unsigned EFI files; >3 is unusual
+                            $uefiFindings += @{
+                                Category = "Multiple Unsigned UEFI Executables"
+                                Severity = "MEDIUM"
+                                Evidence = "Found $($unsignedEfiFiles.Count) unsigned/invalid .efi files in ESP"
+                                Files = ($unsignedEfiFiles | Select-Object -First 5 | ForEach-Object {$_.Path}) -join "; "
+                                Impact = "Unsigned UEFI executables bypass Secure Boot; potential bootkit vector"
+                                SuspicionScore = 55
+                            }
+                            Write-OperationLog "MEDIUM: Multiple unsigned EFI files: $($unsignedEfiFiles.Count)" "WARNING"
+                        }
+                        
+                        # Remove temporary drive letter if we added it
+                        if (-not $hadLetter) {
+                            $esp | Remove-PartitionAccessPath -AccessPath "$espDrive\"
+                        }
+                        
+                    } catch {
+                        Write-OperationLog "Could not scan ESP partition: $_" "INFO"
+                    }
+                }
+                
+            } catch {
+                Write-OperationLog "Could not locate EFI System Partition: $_" "INFO"
+            }
+            
+            # 2. Check TPM Platform Configuration Registers (PCRs) if available
+            try {
+                $tpm = Get-Tpm -ErrorAction SilentlyContinue
+                
+                if ($tpm -and $tpm.TpmPresent) {
+                    # Check if TPM is enabled and ready
+                    if (-not $tpm.TpmReady) {
+                        $uefiFindings += @{
+                            Category = "TPM Not Ready"
+                            Severity = "MEDIUM"
+                            Evidence = "TPM present but not in ready state (Enabled: $($tpm.TpmEnabled), Owned: $($tpm.TpmOwned))"
+                            Impact = "TPM should validate firmware integrity; disabled TPM allows bootkit persistence"
+                            SuspicionScore = 45
+                        }
+                        Write-OperationLog "MEDIUM: TPM not ready - bootkit risk" "WARNING"
+                    }
+                    
+                    # Note: Direct PCR reading requires low-level TPM commands not available via Get-Tpm
+                    # We can infer issues if measured boot is disabled
+                    $measuredBoot = Get-CimInstance -Namespace "root\cimv2\Security\MicrosoftTpm" `
+                        -ClassName Win32_Tpm -ErrorAction SilentlyContinue
+                    
+                    if ($measuredBoot -and -not $measuredBoot.IsEnabled_InitialValue) {
+                        $uefiFindings += @{
+                            Category = "Measured Boot Disabled"
+                            Severity = "MEDIUM"
+                            Evidence = "TPM-based measured boot is disabled"
+                            Impact = "Firmware modifications not recorded in TPM PCRs - bootkit can evade detection"
+                            SuspicionScore = 50
+                        }
+                        Write-OperationLog "MEDIUM: Measured boot disabled" "WARNING"
+                    }
+                } else {
+                    Write-OperationLog "TPM not present or not accessible" "INFO"
+                }
+            } catch {
+                Write-OperationLog "Could not check TPM status: $_" "INFO"
+            }
+            
+            # 3. Verify UEFI Secure Boot database integrity
+            try {
+                $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+                
+                if ($secureBootEnabled) {
+                    # Check UEFI variable databases
+                    $uefiDatabases = @("PK", "KEK", "db", "dbx")  # Platform Key, Key Exchange Key, Signature DB, Forbidden DB
+                    $corruptDatabases = @()
+                    
+                    foreach ($dbName in $uefiDatabases) {
+                        try {
+                            $dbContent = Get-SecureBootUEFI -Name $dbName -ErrorAction Stop
+                            
+                            # Basic sanity check - databases shouldn't be empty
+                            if ($dbContent.Bytes.Length -eq 0) {
+                                $corruptDatabases += $dbName
+                            }
+                        } catch {
+                            $corruptDatabases += $dbName
+                        }
+                    }
+                    
+                    if ($corruptDatabases.Count -gt 0) {
+                        $uefiFindings += @{
+                            Category = "UEFI Variable Database Corruption"
+                            Severity = "HIGH"
+                            Evidence = "UEFI Secure Boot databases are missing or corrupted: $($corruptDatabases -join ', ')"
+                            Impact = "Compromised UEFI variables allow bootkit to persist across reboots"
+                            CorruptedDBs = $corruptDatabases -join ", "
+                            SuspicionScore = 75
+                        }
+                        Write-OperationLog "HIGH: UEFI database corruption detected: $($corruptDatabases -join ', ')" "WARNING"
+                    }
+                    
+                } else {
+                    Write-OperationLog "Secure Boot is disabled, skipping database checks" "INFO"
+                }
+            } catch {
+                Write-OperationLog "Could not verify Secure Boot databases: $_" "INFO"
+            }
+            
+            # 4. Check for known UEFI rootkit indicators
+            # LoJax, MosaicRegressor, etc. often modify specific UEFI modules
+            $knownRootkitPaths = @(
+                "ESP:\EFI\Boot\lojax.efi",
+                "ESP:\EFI\Microsoft\Boot\bootmgfw_backup.efi",  # Backup created by some rootkits
+                "ESP:\EFI\Boot\grubx64.efi",  # Suspicious if not a dual-boot system
+                "ESP:\EFI\Boot\fallback.efi"  # Sometimes abused
+            )
+            
+            # Check registry for UEFI boot order modifications
+            try {
+                $bootOrder = bcdedit /enum firmware | Select-String -Pattern "identifier|description|path" -Context 0,2
+                
+                # Look for unusual boot entries
+                $suspiciousBootEntries = $bootOrder | Where-Object {
+                    $_.Line -match "pcileech|dma|kernel|exploit|unknown"
+                }
+                
+                if ($suspiciousBootEntries) {
+                    $uefiFindings += @{
+                        Category = "Suspicious UEFI Boot Entry"
+                        Severity = "HIGH"
+                        Evidence = "Found suspicious entries in UEFI boot configuration"
+                        Impact = "Modified boot order can load malicious UEFI applications before OS"
+                        SuspicionScore = 80
+                    }
+                    Write-OperationLog "HIGH: Suspicious UEFI boot entry detected" "WARNING"
+                }
+            } catch {
+                Write-OperationLog "Could not enumerate UEFI boot entries: $_" "INFO"
+            }
+            
+            if ($uefiFindings.Count -gt 0) {
+                [void](Report-ScoredFinding -Category "UEFI Integrity" -Findings $uefiFindings)
+            }
+            
+            Add-AuditEntry -CheckName "UEFI Integrity" -Status "Completed" `
+                -ItemsScanned 4 -SuspiciousFound $uefiFindings.Count `
+                -Details @{
+                    FirmwareType = $firmwareType
+                    SecureBootEnabled = (try { Confirm-SecureBootUEFI } catch { $false })
+                    TPMPresent = (try { (Get-Tpm).TpmPresent } catch { $false })
+                    UnsignedEFIFiles = if ($unsignedEfiFiles) { $unsignedEfiFiles.Count } else { 0 }
+                }
+        }
+        
+    } catch {
+        Write-OperationLog "Error during UEFI integrity checks: $_" "ERROR"
+    }
+    #endregion UEFI Integrity Checking
+    
+    #region Device Timing Analysis
+    Write-Progress -Activity "System Analysis" -Status "Check 29/29: Device Connection Pattern Analysis" -PercentComplete 100
+    Write-OperationLog "Starting historical device timing analysis" "INFO"
+    
+    try {
+        $timingFindings = @()
+        $lookbackDays = 90  # Analyze last 90 days of device activity
+        
+        # 1. Analyze Windows Event Logs for device arrival/removal patterns
+        try {
+            $startDate = (Get-Date).AddDays(-$lookbackDays)
+            
+            # Event IDs: 20001 (Device Installation), 20003 (Device Removal), 10000 (Driver Install Start)
+            $deviceEvents = Get-WinEvent -FilterHashtable @{
+                LogName = 'System'
+                ProviderName = 'Microsoft-Windows-UserPnp', 'Microsoft-Windows-Kernel-PnP'
+                StartTime = $startDate
+            } -ErrorAction SilentlyContinue | Where-Object {
+                $_.Id -in @(20001, 20003, 10000, 10001)
+            }
+            
+            if ($deviceEvents) {
+                # Group events by device instance ID
+                $deviceActivity = @{}
+                
+                foreach ($event in $deviceEvents) {
+                    # Extract device ID from event message
+                    if ($event.Message -match 'Device ([A-Z0-9\\]+)') {
+                        $deviceId = $matches[1]
+                        
+                        if (-not $deviceActivity.ContainsKey($deviceId)) {
+                            $deviceActivity[$deviceId] = @{
+                                Arrivals = @()
+                                Removals = @()
+                                DeviceID = $deviceId
+                            }
+                        }
+                        
+                        if ($event.Id -in @(20001, 10000)) {
+                            $deviceActivity[$deviceId].Arrivals += $event.TimeCreated
+                        } elseif ($event.Id -in @(20003, 10001)) {
+                            $deviceActivity[$deviceId].Removals += $event.TimeCreated
+                        }
+                    }
+                }
+                
+                # Analyze connection patterns
+                foreach ($deviceId in $deviceActivity.Keys) {
+                    $activity = $deviceActivity[$deviceId]
+                    $totalConnections = $activity.Arrivals.Count
+                    
+                    # Suspicious pattern 1: Very few connections (<5) but recent activity
+                    if ($totalConnections -gt 0 -and $totalConnections -lt 5) {
+                        $mostRecentConnection = $activity.Arrivals | Sort-Object -Descending | Select-Object -First 1
+                        $daysSinceLastConnect = ((Get-Date) - $mostRecentConnection).Days
+                        
+                        # Get device details
+                        $device = Get-CachedPnpDevices | Where-Object {$_.InstanceId -eq $deviceId} | Select-Object -First 1
+                        
+                        if ($daysSinceLastConnect -lt 7 -and $device) {
+                            $timingFindings += @{
+                                Category = "Intermittent Device Connection"
+                                Severity = "MEDIUM"
+                                Evidence = "Device '$($device.FriendlyName)' connected only $totalConnections time(s) in $lookbackDays days"
+                                DeviceID = $deviceId
+                                LastConnection = $mostRecentConnection.ToString("yyyy-MM-dd HH:mm:ss")
+                                Impact = "Attack hardware often only connected during gaming sessions to avoid detection"
+                                SuspicionScore = 40
+                            }
+                            Write-OperationLog "MEDIUM: Intermittent device: $($device.FriendlyName)" "WARNING"
+                        }
+                    }
+                    
+                    # Suspicious pattern 2: Rapid connect/disconnect cycles (potential testing/evasion)
+                    if ($totalConnections -gt 10) {
+                        $sortedArrivals = $activity.Arrivals | Sort-Object
+                        $shortIntervals = 0
+                        
+                        for ($i = 1; $i -lt $sortedArrivals.Count; $i++) {
+                            $interval = ($sortedArrivals[$i] - $sortedArrivals[$i-1]).TotalMinutes
+                            if ($interval -lt 5) {
+                                $shortIntervals++
+                            }
+                        }
+                        
+                        # More than 30% of connections within 5 minutes of previous
+                        if ($shortIntervals -gt ($totalConnections * 0.3)) {
+                            $device = Get-CachedPnpDevices | Where-Object {$_.InstanceId -eq $deviceId} | Select-Object -First 1
+                            
+                            if ($device) {
+                                $timingFindings += @{
+                                    Category = "Rapid Connect/Disconnect Pattern"
+                                    Severity = "MEDIUM"
+                                    Evidence = "Device '$($device.FriendlyName)' shows $shortIntervals rapid reconnections (>30% within 5min)"
+                                    DeviceID = $deviceId
+                                    TotalConnections = $totalConnections
+                                    Impact = "Rapid cycling may indicate attacker testing device or evading detection"
+                                    SuspicionScore = 45
+                                }
+                                Write-OperationLog "MEDIUM: Rapid cycling device: $($device.FriendlyName)" "WARNING"
+                            }
+                        }
+                    }
+                }
+                
+                Write-OperationLog "Analyzed $($deviceActivity.Keys.Count) unique devices from event logs" "INFO"
+            }
+            
+        } catch {
+            Write-OperationLog "Could not analyze device event logs: $_" "INFO"
+        }
+        
+        # 2. Parse setupapi.dev.log for installation timing patterns
+        try {
+            $setupApiLog = "$env:windir\inf\setupapi.dev.log"
+            
+            if (Test-Path $setupApiLog) {
+                # Read last 10,000 lines to avoid parsing entire log (can be huge)
+                $logContent = Get-Content $setupApiLog -Tail 10000 -ErrorAction SilentlyContinue
+                
+                # Look for device installations with timestamps
+                $recentInstalls = @{}
+                
+                foreach ($line in $logContent) {
+                    # Match timestamp lines: ">>>  [Device Install (Hardware initiated) - PCI\VEN_..."
+                    if ($line -match '>>>\s+\[Device Install.*?\]\s+-\s+([A-Z0-9\\&_]+)') {
+                        $deviceId = $matches[1]
+                        
+                        # Next line usually contains timestamp
+                        $timestampIndex = [array]::IndexOf($logContent, $line) + 1
+                        if ($timestampIndex -lt $logContent.Length) {
+                            $timestampLine = $logContent[$timestampIndex]
+                            
+                            if ($timestampLine -match '>>>\s+Section start (\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)') {
+                                $timestamp = $matches[1]
+                                
+                                try {
+                                    $installTime = [DateTime]::ParseExact($timestamp, "yyyy/MM/dd HH:mm:ss.fff", $null)
+                                    
+                                    if (-not $recentInstalls.ContainsKey($deviceId)) {
+                                        $recentInstalls[$deviceId] = @()
+                                    }
+                                    
+                                    $recentInstalls[$deviceId] += $installTime
+                                } catch {
+                                    # Skip invalid timestamps
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                # Check for devices installed very recently (within last 7 days) but not currently present
+                $recentThreshold = (Get-Date).AddDays(-7)
+                $currentDevices = Get-CachedPnpDevices | ForEach-Object {$_.InstanceId}
+                
+                foreach ($deviceId in $recentInstalls.Keys) {
+                    $latestInstall = $recentInstalls[$deviceId] | Sort-Object -Descending | Select-Object -First 1
+                    
+                    if ($latestInstall -gt $recentThreshold -and $deviceId -notin $currentDevices) {
+                        # Device was installed recently but is now gone
+                        $timingFindings += @{
+                            Category = "Recently Removed Device"
+                            Severity = "MEDIUM"
+                            Evidence = "Device installed on $($latestInstall.ToString('yyyy-MM-dd HH:mm')) but no longer present"
+                            DeviceID = $deviceId
+                            InstallCount = $recentInstalls[$deviceId].Count
+                            Impact = "Device removal after use typical of covert attack hardware"
+                            SuspicionScore = 50
+                        }
+                        Write-OperationLog "MEDIUM: Recently removed device: $deviceId" "WARNING"
+                    }
+                }
+                
+                Write-OperationLog "Parsed setupapi.dev.log: found $($recentInstalls.Keys.Count) recent installations" "INFO"
+            }
+            
+        } catch {
+            Write-OperationLog "Could not parse setupapi.dev.log: $_" "INFO"
+        }
+        
+        # 3. Check for devices with suspicious connection time correlation
+        # (e.g., always connects around same time - possible automated attack)
+        try {
+            if ($deviceActivity -and $deviceActivity.Keys.Count -gt 0) {
+                foreach ($deviceId in $deviceActivity.Keys) {
+                    $arrivals = $deviceActivity[$deviceId].Arrivals
+                    
+                    if ($arrivals.Count -gt 5) {
+                        # Group by hour of day
+                        $hourGroups = $arrivals | Group-Object {$_.Hour}
+                        
+                        # If >70% of connections happen in same 2-hour window, flag it
+                        $largestGroup = $hourGroups | Sort-Object Count -Descending | Select-Object -First 1
+                        
+                        if ($largestGroup -and ($largestGroup.Count / $arrivals.Count) -gt 0.7) {
+                            $device = Get-CachedPnpDevices | Where-Object {$_.InstanceId -eq $deviceId} | Select-Object -First 1
+                            
+                            if ($device) {
+                                $timingFindings += @{
+                                    Category = "Predictable Connection Times"
+                                    Severity = "LOW"
+                                    Evidence = "Device '$($device.FriendlyName)' connects $($largestGroup.Count)/$($arrivals.Count) times around $($largestGroup.Name):00"
+                                    DeviceID = $deviceId
+                                    Impact = "Consistent connection timing may indicate scripted/automated attack setup"
+                                    SuspicionScore = 25
+                                }
+                                Write-OperationLog "LOW: Predictable timing: $($device.FriendlyName)" "INFO"
+                            }
+                        }
+                    }
+                }
+            }
+            
+        } catch {
+            Write-OperationLog "Could not analyze connection time correlation: $_" "INFO"
+        }
+        
+        if ($timingFindings.Count -gt 0) {
+            [void](Report-ScoredFinding -Category "Device Timing Analysis" -Findings $timingFindings)
+        }
+        
+        Add-AuditEntry -CheckName "Device Timing Analysis" -Status "Completed" `
+            -ItemsScanned 3 -SuspiciousFound $timingFindings.Count `
+            -Details @{
+                LookbackDays = $lookbackDays
+                DevicesAnalyzed = if ($deviceActivity) { $deviceActivity.Keys.Count } else { 0 }
+                IntermittentDevices = ($timingFindings | Where-Object {$_.Category -eq "Intermittent Device Connection"}).Count
+                RapidCyclingDevices = ($timingFindings | Where-Object {$_.Category -eq "Rapid Connect/Disconnect Pattern"}).Count
+                RecentlyRemovedDevices = ($timingFindings | Where-Object {$_.Category -eq "Recently Removed Device"}).Count
+            }
+        
+    } catch {
+        Write-OperationLog "Error during device timing analysis: $_" "ERROR"
+    }
+    #endregion Device Timing Analysis
     
     # 4. Collect Current Device List
     # Silent collection
@@ -2123,9 +4349,34 @@ For questions or support, refer to the System Analyzer documentation.
     $logContent += "FILE OPERATIONS:"
     $logContent += ("-" * 80)
     
+    # Finalize the comprehensive operation log BEFORE compression/deletion
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    Write-OperationLog "SYSTEM ANALYSIS COMPLETE" "SUCCESS"
+    Write-OperationLog "═══════════════════════════════════════════════════════════════" "INFO"
+    
+    Write-OperationLog "Scan summary" "INFO" -Details @{
+        TotalFindings = $script:findings.Count
+        TotalChecks = $script:auditLog.Count
+        ChecksCompleted = (($script:auditLog | Where-Object { $_.Status -eq 'Completed' }).Count)
+        ChecksWithErrors = (($script:auditLog | Where-Object { $_.Status -eq 'Error' }).Count)
+        ScanDurationSeconds = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 2)
+    }
+    
+    # Save the comprehensive operation log with statistics BEFORE compression
+    Save-OperationLog
+    
+    # Copy the comprehensive operation log to the scan folder (root) for easy access
+    $scanFolderOperationLog = Join-Path $scanFolder "OPERATION_LOG.txt"
+    Copy-Item -Path $script:operationLogPath -Destination $scanFolderOperationLog -Force -ErrorAction SilentlyContinue
+    
     try {
         # Log compression operation
         $logContent += "Compressing forensic data to: $zipPath"
+        Write-OperationLog "Creating compressed archive" "ACTION" -Details @{
+            SourceFolder = $forensicFolder
+            DestinationZip = $zipPath
+        }
+        
         Compress-Archive -Path $forensicFolder -DestinationPath $zipPath -CompressionLevel Optimal -Force -ErrorAction Stop
         $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
         $logContent += "SUCCESS: Archive created ($zipSize MB)"
@@ -2147,19 +4398,6 @@ For questions or support, refer to the System Analyzer documentation.
         $logContent += "ERROR: Failed to compress or cleanup - $($_.Exception.Message)"
         Write-Host "[!] " -NoNewline -ForegroundColor Yellow
         Write-Host "Could not create ZIP archive: $($_.Exception.Message)" -ForegroundColor Gray
-    } finally {
-        # Always save operation log
-        $logContent += ""
-        $logContent += "SCAN SUMMARY:"
-        $logContent += ("-" * 80)
-        $logContent += "Total Findings: $($script:findings.Count)"
-        $logContent += "Total Checks: $($script:auditLog.Count)"
-        $logContent += "Checks Completed: $(($script:auditLog | Where-Object { $_.Status -eq 'Completed' }).Count)"
-        $logContent += "Checks with Errors: $(($script:auditLog | Where-Object { $_.Status -eq 'Error' }).Count)"
-        $logContent += ""
-        $logContent += "Log end: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        
-        $logContent | Out-File -FilePath $operationLog -Encoding UTF8
     }
 }
 
